@@ -3,10 +3,21 @@
 Field notes and working code for getting [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 onto a small cluster of 128 GB unified-memory machines at TP=4.
 
-**Status: partial.** Weight conversion, sharding, FP4 kernel validation and transformers
-config registration all work and are covered here. vLLM cannot yet *serve* the model — four
-features are genuinely absent from its DeepSeek-V4 implementation. This repo documents exactly
-which four, so nobody else has to rediscover it.
+**Status: partial, and precisely so.**
+
+| stage | state |
+|---|---|
+| FP4 MoE kernels on SM 12.1 | ✅ verified (`model.py` self-test, exit 0) |
+| TP=4 conversion + sharding | ✅ verified (9 min, expert ranges disjoint, `F4` preserved) |
+| engram mmap lookup | ✅ verified (22.9 GiB fp8 table at 0.49 GiB RSS) |
+| `deepseek_v41` config through vLLM's `ModelConfig` | ✅ **end-to-end, 31 assertions** |
+| reference-implementation model **load** | ⚠️ OOMs on the tightest node — see below |
+| vLLM **serving** | ❌ four features absent; adaptation drafted, untested |
+
+The config path is genuinely end-to-end: `AutoConfig` parses the real checkpoint and
+`vllm.config.ModelConfig` resolves it at four context lengths. Everything downstream of that
+is where the remaining work is, and this repo is explicit about which parts are verified and
+which are written-but-unproven.
 
 Everything below was measured on real hardware, not estimated. Numbers that are estimates are
 labelled as such.
@@ -207,6 +218,29 @@ load_split(model, ckpt_path, rank, world_size)
   politely — it starves the kernel, the global OOM-killer reaps whatever it likes, and the
   machine can reboot. Unified memory means a CUDA overcommit is a system overcommit.
 
+  **This is now measured both ways.** Uncapped, the same workload rebooted a node and the
+  global OOM-killer took an unrelated user service with it. Capped at 0.82, an
+  over-allocation on the same hardware produced a contained `SIGKILL` of the offending
+  process only: no reboot, no kernel OOM-kill event on that node, co-user services still
+  `active`. The cap converts a cluster-wide incident into a process-level failure.
+
+### Loading is tighter than converting — expect to tune this
+
+With engram on disk the resident backbone is 74.5 GiB of a ~121 GiB unified pool. Weight
+loading then has to read 74.5 GiB of safetensors **through page cache that shares that same
+pool**, so the headroom during load is much thinner than the steady-state figure suggests.
+
+On a 4-node run the node with the least free memory (115 GiB available vs 117 on its peers,
+because of a couple of unrelated resident containers) OOMed during load while the others were
+fine. `torchrun` then `SIGKILL`ed every other rank, so **all four logs show `exitcode -9` and
+none of them identifies the culprit** — find it by checking which node actually logged kernel
+OOM events (`journalctl -b 0 | grep -ci oom`), not by reading torchrun's timestamps, which
+record when each agent noticed rather than when anything failed.
+
+Practical consequences: size for your *tightest* node, not your average one; stop unrelated
+containers on the ranks first; and consider a lower cap with correspondingly lower
+`max_seq_len` / `max_batch_size` while bringing a new deployment up.
+
 ---
 
 ## Step 4 — register `deepseek_v41` with transformers
@@ -286,8 +320,30 @@ estimate after digging into vLLM's internals: engram is the only one that needs 
 machinery; the other three extend or wire up primitives that already exist.
 
 1. **Engram** — 6 tensor shapes across 2 layers (`embed.weight/.scale`, `wkv.weight/.scale`,
-   `q_weight`, `k_weight`). The reference module is ~75 lines; attach at the existing
-   `hash_moe` layer type.
+   `q_weight`, `k_weight`).
+
+   The reference applies it to the hyper-connection residual stream **between the previous
+   layer's `post` and this layer's `pre`** — and vLLM fuses exactly those two into
+   `mhc_fused_post_pre_tilelang`, so there is normally no seam there. Two primitives vLLM
+   already has create one without patching any vLLM source:
+
+   * `mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)` reconstructs precisely
+     the reference's `h` (vLLM already calls it to build draft-model aux states);
+   * the decoder layer's `residual is None` branch runs an **unfused** `mhc_pre` on whatever
+     `x` it is handed.
+
+   So: reconstruct `h`, apply engram, hand it back as `x` with `residual=None`. That
+   reproduces `post -> engram -> pre` exactly, at the cost of losing post/pre fusion on 2 of
+   40 layers. [`tools/vllm_dsv41.py`](tools/vllm_dsv41.py) implements this as a layer
+   wrapper. **It is written, reviewed and unproven — not yet run end-to-end.**
+
+   The genuinely hard part is not the module, it is the n-gram history: hashing needs each
+   token's predecessors, and the reference relies on a static right-padded batch with an
+   absolute-position cache. Under continuous batching that assumption is gone. The draft
+   yields the pad id wherever history is unavailable (the same thing the reference does at a
+   sequence start), which is correct at a boundary and conservative mid-sequence — and it
+   degrades quality **silently** when wrong. Diff logits against the reference on identical
+   prompts before trusting it; there is a helper for that at the bottom of the module.
 2. **CED** — decoder layers project global KV from the final encoder hidden states rather than
    their own, driven by `kv_source_layer_ids` / `index_source_layer_ids`. No new weights, and
    **vLLM already has the primitive**: `kv_sharing_target_layer_name` is a first-class
