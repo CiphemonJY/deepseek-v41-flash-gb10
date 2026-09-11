@@ -57,10 +57,14 @@ suite 7/7; a 4-way concurrent garble check clean. `GMU=0.72` fails cleanly with 
 **Bisected — CUDA graphs are broken on this image; DSpark is fine.** Graphs ON + DSpark OFF: boots, HTTP 200, output is
 garbage (U+FFFD). Graphs ON + DSpark ON (the reference's boot 10): first request dies with `CUDA error: an illegal memory
 access` in `fused_moe/runner/moe_runner.py:_maybe_reduce_final_output` — DSpark's rejection sampler consuming the corrupted
-memory. DSpark ON + graphs OFF: clean, 2.2x faster than plain eager. The one component that differs from the reference's
-working graphs boots is the compiled `_C_stable_libtorch` (0909's sm_120 SASS vs their sm_121a rebuild via
-`build_stable_ext.sh`), so that rebuild is the remaining lever toward their ~74 tok/s. It cannot be built on a serving rank
-(nvcc beside a ~115 GiB serve on unified memory = OOM reboot).
+memory. DSpark ON + graphs OFF: clean, 2.2x faster than plain eager. **Rebuilding `_C_stable_libtorch` from the branch's csrc did NOT fix it** (maintenance window, 2026-09-11): the reference's
+`build_stable_ext.sh` takes **6 minutes** on a GB10 (-j16, `NVCC_THREADS=2`, min 71 GiB free, cgroup-capped — not hours), and
+this tree's `CUDA_SUPPORTED_ARCHS` tops out at 12.0, so `TORCH_CUDA_ARCH_LIST=12.1a` becomes `sm_120` + `sm_120f` (the reference's
+"sm_121a" is the same thing). With the rebuilt extension, graphs ON still yields empty/garbage text on every request
+(`/v1/completions` returns `''` for 40 generated tokens; chat `content: null`). So the corruption is not in that extension.
+Remaining suspects, untested: the exact nightly base they used (`nightly-8a728663`) vs the 0909 image's other libraries
+(torch/NCCL/FlashInfer build), and the graph-replayed sparse-MLA/collective path on this fabric. Eager + DSpark is the
+stable configuration here.
 
 ### Gotchas that cost node reboots
 
@@ -83,13 +87,13 @@ working graphs boots is the compiled `_C_stable_libtorch` (0909's sm_120 SASS vs
 | aspect | tonyd2wild | here | why |
 |---|---|---|---|
 | base image | `vllm/vllm-openai:nightly-8a728663…` (the `dsv41-feat` merge-base) + the branch python tree copied in (`overlay1`) | the official `vllm/vllm-openai:deepseekv41-flash-0909-arm64` tag + the branch python tree copied over it (`Dockerfile.branch`) | the 0909 tag already ships a `_C_stable_libtorch` that loads on GB10 and a `deepseek_v4_1` tree; only its `engram.py` revision is incompatible with the branch patches, so the tree is swapped |
-| compiled extension | `_C_stable_libtorch` **rebuilt for sm_121a** (`build_stable_ext.sh`, cutlass, -j20) | the 0909 image's own build (sm_120 SASS) — **not rebuilt** | avoids a multi-hour CUDA build; every custom op the V4.1 NVIDIA path references is present. **Consequence: CUDA graphs produce garbage on this extension** (see below) — the rebuild is the remaining lever |
+| compiled extension | `_C_stable_libtorch` rebuilt (`build_stable_ext.sh`, cutlass, -j20) | first the 0909 image's own build; then **also rebuilt** from the branch csrc (6 min) as `vllm-dsv41:branch-ext` | the rebuild is cheap and correct (`sm_120`/`sm_120f`; 12.1a maps to the 12.0 family in this tree) — but it did **not** fix graph mode, so it is not what makes their graphs boots work |
 | FlashInfer | 0.7.0rc1 from source, pinned submodules (`overlay3`) + kernel prewarms (`overlay4/5`) | same (`Dockerfile.fi07`, `Dockerfile.v41`) | 0.6.18 lacks the SM120 sparse-MLA decode for top-k 1152 |
 | patches | the 7 files bind-mounted from `~/patches/dsv41-boot10` | identical files, identical mounts | byte-for-byte; **verify md5 against their `patch/README.md`** (CRLF gotcha) |
 | checkpoint placement | head on NVMe, workers over NFS; per-rank Engram rows copied locally (`engram_local.py`) | the full checkpoint local on **every** rank; Engram read directly from the local shards | no NFS, no `ENGRAM_LOCAL` step; loads 48 shards in ~45 s |
 | serving config | boot 10: CUDA graphs `FULL_AND_PIECEWISE` + DSpark k=5, 300K, gmu 0.80, vision + tools — **~74 tok/s** | **eager + DSpark k=5**, 131K, gmu 0.80, vision + tools — **~33 tok/s** | graphs unusable on the unrebuilt extension; DSpark alone gives 2.2x |
 | launcher | `dsv41-tp4.sh` + `prelaunch-*.sh` md5 checks, `postcheck10.sh`, `dgx-anti-oom` | `launch41.sh` with the gate **built in** (md5 vs their table, CR scan, in-container import/marker proof), host-side log capture, a `docker kill` kill-switch at MemAvailable < 2 GiB | three node reboots taught that the gate must be fail-closed and inside the launcher; `dgx-anti-oom` is not on this fleet |
-| CUDA-graph bisect on this image | n/a (their extension works) | **graphs ON, DSpark OFF → HTTP 200 with garbled output (U+FFFD)**; graphs ON + DSpark → illegal memory access in the MoE reduce | the corruption is in graph replay on the sm_120-built extension; DSpark merely trips over it. Never serve `EAGER=0` on this image |
+| CUDA-graph bisect on this image | n/a (their graphs boots work) | **graphs ON, DSpark OFF → HTTP 200 with garbled/empty output**, on both the 0909 extension and the rebuilt one; graphs ON + DSpark → illegal memory access in the MoE reduce | corruption is in graph replay and is NOT the extension; DSpark merely trips over it. Never serve `EAGER=0` on this image lineage |
 
 ## TL;DR findings
 
