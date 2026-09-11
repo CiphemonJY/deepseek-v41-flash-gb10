@@ -3,7 +3,7 @@
 Field notes and working code for getting [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 onto a small cluster of 128 GB unified-memory machines at TP=4.
 
-**Status (2026-09-11): SERVING on vLLM, TP=4 — eager + DSpark k=5 (33-35 tok/s single-stream), vision + tools. CUDA graphs: no usable configuration on this fleet after 12 boots / 2 lineages / 3 NCCL envs (see the graphs section).**
+**Status (2026-09-11): SERVING on vLLM, TP=4 — eager + DSpark k=5 (30-39 tok/s single-stream), vision + tools. CUDA graphs: no usable configuration on this fleet after 12 boots / 2 lineages / 3 NCCL envs (see the graphs section).**
 
 | stage | state |
 |---|---|
@@ -14,7 +14,7 @@ onto a small cluster of 128 GB unified-memory machines at TP=4.
 | reference-implementation model **load** | ✅ with `load_split.py` (per-tensor streaming, engram on `meta`) |
 | reference-implementation **generation** | OK - verified, correct text AND correct multimodal answers |
 | vLLM config + architecture registration | superseded — the `deepseek_v4_1` tree ships its own; the shim was only needed on the V4-only build |
-| vLLM **serving** | ✅ **eager + DSpark k=5, vision + tool calling, 131K ctx, ~33 tok/s** — `launch/`, `build/`, `gate/` (Served section). CUDA graphs: garbled on this image (bisected) |
+| vLLM **serving** | ✅ **eager + DSpark k=5, vision + tool calling, 131K ctx, ~30-35 tok/s** — `launch/`, `build/`, `gate/` (Served section). CUDA graphs: garbled on this image (bisected) |
 
 The config path is genuinely end-to-end: `AutoConfig` parses the real checkpoint and
 `vllm.config.ModelConfig` resolves it at four context lengths. Everything downstream of that
@@ -51,7 +51,7 @@ is the standalone no-GPU version of the gate. Set `HEAD_IP`, `RANK{0..3}_IP`, `R
 
 **Serving config (final):** `GMU=0.80 MAXLEN=131072 SEQS=8 EAGER=1 SPEC=dspark SPEC_K=5 TEXT_ONLY=0 PARSERS=1` with
 `--limit-mm-per-prompt {"image":4} --mm-processor-cache-gb 1`. Measured: 48 shards load in ~45 s from local NVMe;
-~9 GiB free at steady state; **32.8 tok/s** single-stream with DSpark (14.9 without); the reference's vision + tool-calling
+~9 GiB free at steady state; **30-39 tok/s** single-stream with DSpark across restores (14.9 without); the reference's vision + tool-calling
 suite 7/7; a 4-way concurrent garble check clean. `GMU=0.72` fails cleanly with `No available memory for the cache blocks` (~79 GiB of weights leave no KV).
 
 **Bisected — CUDA graphs are broken on this image; DSpark is fine.** Graphs ON + DSpark OFF: boots, HTTP 200, output is
@@ -75,7 +75,7 @@ With CUDA graphs on (`EAGER=0`), **11 of 12 boots produced garbage from the firs
 across three NCCL environments (the previous serve's dual-rail/LL128 env, the same minus `NCCL_PROTO=LL128`, and the reference's
 plain env with a 4-channel cap). The single clean graph boot was the minimal config — no DSpark, `--language-model-only`, no
 parsers, LL128 dropped — at 28.8 tok/s cold, observed once and not reproduced; every combination that adds DSpark, vision, or
-the parsers garbled, so none of those is the discriminator. That minimal config is slower than eager + DSpark (33-35 tok/s)
+the parsers garbled, so none of those is the discriminator. That minimal config is slower than eager + DSpark (30-39 tok/s)
 and drops features, so **graphs are off in production here**. Forced `NCCL_PROTO=LL128` is the best-supported suspect (all
 three lineages garbled with it; the one clean boot was without it) but not a certified cause. `launch41.sh` exposes
 `NCCL_DROP="PROTO ..."` / `NCCL_SET="K=V ..."` / `NCCL_ENV_MODE=ref` for further bisecting; note the reference's plain env
@@ -83,7 +83,7 @@ without a channel cap costs ~7 GiB of load-time headroom on this fleet and gets 
 differences from the reference (driver/firmware/`90-spark-hang-guard` sysctls) and `VLLM_USE_BREAKABLE_CUDAGRAPH`.
 
 **Production config:** `EAGER=1 SPEC=dspark SPEC_K=5 TEXT_ONLY=0 PARSERS=1 GMU=0.80 MAXLEN=131072 NCCL_DROP=PROTO` on the
-0909-lineage image — 33-35 tok/s single-stream, 7/7 vision + tools, 4-way concurrent garble check clean.
+0909-lineage image — 30-39 tok/s single-stream, 7/7 vision + tools, 4-way concurrent garble check clean.
 
 ### Second investigation (council + red-team loop, 2026-09-11 evening): the defect, named
 
@@ -95,8 +95,8 @@ baseline, `tools/battery.py`, `tools/xid_since.sh`, `tools/postboot.sh`; launche
   on replication under `VLLM_LOGGING_LEVEL=DEBUG` (2/2), 2000-token prompt and 6 concurrent streams clean, zero Xids.
 * **The full config fails on the first request in 4/4 boots.** In three of them (19:03Z, 19:34Z, 19:54Z) the head log
   carries `tvm.error.InternalError: [MXFP8 SM120 gemm Runner] Failed to initialize cutlass MXFP8 gemm on sm120` and
-  `Failed to initialize the TMA descriptor 700` (a sticky illegal-address error surfacing at a detection point), preceded
-  by a NaN first forward (`Out of range float` on the response); the 19:13Z boot faulted with illegal-access errors
+  `Failed to initialize the TMA descriptor 700` (a sticky illegal-address error surfacing at a detection point); in the
+  19:54Z boot the first response also carried `Out of range float`, i.e. a NaN first forward (the other boots did not log it); the 19:13Z boot faulted with illegal-access errors
   without those two lines. Every event put `Xid 31 ... ACCESS_TYPE_VIRT_READ` on **all four ranks within the same
   second**; in one event all four faulted at the same virtual address, in another the addresses differed and one rank
   reported `FAULT_PTE` rather than `FAULT_PDE`. The same-second/all-ranks pattern points at deterministic software; the
@@ -150,7 +150,7 @@ across ranks; the launcher does not compare them - compare the build-input tarba
 | FlashInfer | 0.7.0rc1 from source, pinned submodules (`overlay3`) + kernel prewarms (`overlay4/5`) | same (`Dockerfile.fi07`, `Dockerfile.v41`) | 0.6.18 lacks the SM120 sparse-MLA decode for top-k 1152 |
 | patches | the 7 files bind-mounted from `~/patches/dsv41-boot10` | identical files, identical mounts | byte-for-byte; **verify md5 against their `patch/README.md`** (CRLF gotcha) |
 | checkpoint placement | head on NVMe, workers over NFS; per-rank Engram rows copied locally (`engram_local.py`) | the full checkpoint local on **every** rank; Engram read directly from the local shards | no NFS, no `ENGRAM_LOCAL` step; loads 48 shards in ~45 s |
-| serving config | boot 10: CUDA graphs `FULL_AND_PIECEWISE` + DSpark k=5, 300K, gmu 0.80, vision + tools — **~74 tok/s** | **eager + DSpark k=5**, 131K, gmu 0.80, vision + tools — **~33 tok/s** | graphs unusable on the unrebuilt extension; DSpark alone gives 2.2x |
+| serving config | boot 10: CUDA graphs `FULL_AND_PIECEWISE` + DSpark k=5, 300K, gmu 0.80, vision + tools — **~74 tok/s** | **eager + DSpark k=5**, 131K, gmu 0.80, vision + tools — **~30-35 tok/s** | graphs unusable on the unrebuilt extension; DSpark alone gives 2.2x |
 | launcher | `dsv41-tp4.sh` + `prelaunch-*.sh` md5 checks, `postcheck10.sh`, `dgx-anti-oom` | `launch41.sh` with the gate **built in** (md5 vs their table, CR scan, in-container import/marker proof), host-side log capture, a `docker kill` kill-switch at MemAvailable < 2 GiB | three node reboots taught that the gate must be fail-closed and inside the launcher; `dgx-anti-oom` is not on this fleet |
 | CUDA-graph bisect on this image | n/a (their graphs boots work) | **graphs ON, DSpark OFF → HTTP 200 with garbled/empty output**, on both the 0909 extension and the rebuilt one; graphs ON + DSpark → illegal memory access in the MoE reduce | corruption is in graph replay and is NOT the extension; DSpark merely trips over it. Never serve `EAGER=0` on this image lineage |
 

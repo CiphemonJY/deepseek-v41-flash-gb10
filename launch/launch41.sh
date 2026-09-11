@@ -80,8 +80,8 @@ else SPEC_ARGS=""; fi
 declare -A REF_MD5=( [engram.py]=c0329107 [model_state.py]=0a14bee6 [weight_utils.py]=7e1027f1 [attention.py]=da9ef196
                      [flashinfer_sparse.py]=af0f8447 [sparse_swa.py]=cc419353 [sparse_attn_indexer.py]=a9b73756 [mounts.txt]=79a774bc )
 for f in "${!REF_MD5[@]}"; do
-  got=$(md5sum "$PATCH_DIR/$f" | cut -c1-8); [ "$got" = "${REF_MD5[$f]}" ] || { echo "GATE FAIL: $f md5 $got != reference ${REF_MD5[$f]} (CRLF? stale?)" >&2; exit 5; }
   [ "$(grep -c $'\r' "$PATCH_DIR/$f")" = 0 ] || { echo "GATE FAIL: $f has CR bytes" >&2; exit 5; }
+  got=$(md5sum "$PATCH_DIR/$f" | cut -c1-8); [ "$got" = "${REF_MD5[$f]}" ] || { echo "GATE FAIL: $f md5 $got != reference ${REF_MD5[$f]} (CRLF? stale?)" >&2; exit 5; }
 done
 # b) inside the exact image+mounts+env: the package imports and every patch's marker symbol is live
 GATE_OUT=$(docker run --rm --entrypoint python3 -e DSV41_ENGRAM_DISK=1 $PATCH_MOUNTS "$IMAGE" -c '

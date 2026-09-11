@@ -7,7 +7,7 @@ set -uo pipefail
 MODE="${1:-start}"
 declare -A HOST=( [0]="${RANK0_SSH:?ssh alias/user@host for rank 0}" [1]="${RANK1_SSH:?}" [2]="${RANK2_SSH:?}" [3]="${RANK3_SSH:?}" )
 KNOBS=""
-for k in LOG_LEVEL ALLOC_CONF EXTRA_ENV CACHE_TAG NCCL_DROP NCCL_SET NCCL_ENV_MODE IMAGE GMU MAXLEN SEQS MAX_BATCHED EAGER CUDAGRAPH_MODE CG_SIZES SPEC SPEC_K SPEC_ADAPT TEXT_ONLY THINKING PARSERS PATCH_NAME VLLM_EXTRA; do
+for k in GATE_ONLY LOG_LEVEL ALLOC_CONF EXTRA_ENV CACHE_TAG NCCL_DROP NCCL_SET NCCL_ENV_MODE IMAGE GMU MAXLEN SEQS MAX_BATCHED EAGER CUDAGRAPH_MODE CG_SIZES SPEC SPEC_K SPEC_ADAPT TEXT_ONLY THINKING PARSERS PATCH_NAME VLLM_EXTRA; do
   v="${!k:-}"; [ -n "$v" ] && KNOBS="$KNOBS $k='$v'"
 done
 S='ssh -o ConnectTimeout=25 -o BatchMode=yes'
@@ -17,7 +17,7 @@ if [ "$MODE" = "stop" ]; then
 fi
 echo "knobs:$KNOBS"
 # council (systems seat): stop ALL ranks head-first before starting, so no worker joins a stale head's rendezvous
-for r in 0 3 2 1; do timeout 60 $S "${HOST[$r]}" 'docker rm -f vllm_dsv41 >/dev/null 2>&1; true' 2>/dev/null; done
+if [ "${GATE_ONLY:-0}" != "1" ]; then for r in 0 3 2 1; do timeout 60 $S "${HOST[$r]}" 'docker rm -f vllm_dsv41 >/dev/null 2>&1; true' 2>/dev/null; done; else echo "GATE_ONLY=1: dry run, not stopping any rank"; fi
 for r in 3 2 1; do
   echo "== rank $r (${HOST[$r]}) =="
   timeout 240 $S "${HOST[$r]}" "export $KNOBS; bash ${DSV41_HOME:-$HOME/dsv41}/launch41.sh $r" 2>&1 | tail -3 || { echo "rank $r launch FAILED" >&2; exit 1; }
