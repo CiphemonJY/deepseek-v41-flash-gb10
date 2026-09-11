@@ -125,6 +125,14 @@ needs.
 across ranks; the launcher does not compare them - compare the build-input tarball md5 if you need identity. A
 `GATE_ONLY=1` dry run of the launcher is safe on a serving rank: the gate runs before any container is removed.
 
+**Eager-mode levers, measured (2026-09-11, same 1/3/6-stream battery; production = 32.4 / 58.4 / 95.4 tok/s aggregate):**
+`--async-scheduling` is unstable with DSpark here — 3-stream runs alternated 46.3 and 15.9 tok/s, the slow runs being every
+request taking ~37 s (a scheduling stall), single-stream 29.7; rejected. `torch.compile` without CUDA graphs
+(`cudagraph_mode=NONE`) is correct (gate PASS, 7/7, no Xids) and within noise of plain eager: 28.8 / 60.4 / 93.3; rejected.
+DSpark acceptance is 55% (about 2.75 of 5 drafts per step), so raising `k` is not a lever either. Single-stream throughput on
+this tree is launch-bound at ~120 ms per decode step; only graph replay removes that, which is the open defect above.
+Aggregate throughput scales with concurrency (about 60 at 3 streams, 90-95 at 6).
+
 ### Gotchas that cost node reboots
 
 * **CRLF.** A Windows git checkout with `core.autocrlf=true` turns the reference's `mounts.txt` and patch files CRLF. A bind-mount
