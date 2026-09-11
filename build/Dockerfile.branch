@@ -1,0 +1,6 @@
+# Stage C: the dsv41-feat python tree over the 0909 image (their overlay1 shape). COPY merges, so the
+# 0909 compiled extensions stay; the pycache purge is REQUIRED (bind-mounted patches are otherwise shadowed).
+# Build context: a sparse checkout of vllm-project/vllm branch dsv41-feat containing only vllm/ .
+FROM vllm-dsv41:v41
+COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+RUN find /usr/local/lib/python3.12/dist-packages/vllm -name "__pycache__" -type d -prune -exec rm -rf {} + && python3 -c "import vllm; print(vllm.__version__)"

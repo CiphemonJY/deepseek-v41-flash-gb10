@@ -1,0 +1,18 @@
+# Stage B: prebuild the two FlashInfer JIT kernels whose RUNTIME compile wedged all four of
+# tonyd2wild's nodes (boot 3), so nothing compiles at serve time. Folds their overlay4 + overlay5.
+#
+# The env below is the launcher's EXACT runtime env. That matters: a prewarm done with
+# FLASHINFER_JIT_VERBOSE/DEBUG set produces different nvcc flags, the runtime cache key then
+# misses, and the kernel recompiles at boot anyway (their overlay3 prewarm was stale for this
+# reason). prewarm5.py strips those vars explicitly.
+FROM vllm-dsv41:fi07
+COPY prewarm5.py /tmp/prewarm5.py
+COPY verify5.py  /tmp/verify5.py
+# overlay4: mxfp8 GEMM for SM120 (7 CUTLASS TUs; MAX_JOBS bounded on purpose)
+RUN FLASHINFER_CUDA_ARCH_LIST=12.1a TORCH_CUDA_ARCH_LIST=12.1a FLASHINFER_DISABLE_VERSION_CHECK=1 VLLM_HAS_FLASHINFER_CUBIN=1 \
+    MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 timeout 3000 python3 -c "from flashinfer.jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8 as gen; spec = gen(); b = getattr(spec, 'build', None); (b(verbose=True) if b else spec.build_and_load()); print('MXFP8-SM120-BUILT')" \
+ && ls /root/.cache/flashinfer/0.7.0rc1/121a/cached_ops/
+# overlay5: sparse MLA for SM120 under the runtime env
+RUN FLASHINFER_CUDA_ARCH_LIST=12.1a TORCH_CUDA_ARCH_LIST=12.1a FLASHINFER_DISABLE_VERSION_CHECK=1 VLLM_HAS_FLASHINFER_CUBIN=1 \
+    MAX_JOBS=4 FLASHINFER_NVCC_THREADS=1 timeout 3000 python3 /tmp/prewarm5.py \
+ && ls /root/.cache/flashinfer/0.7.0rc1/121a/cached_ops/

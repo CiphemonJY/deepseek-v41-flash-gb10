@@ -3,7 +3,7 @@
 Field notes and working code for getting [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 onto a small cluster of 128 GB unified-memory machines at TP=4.
 
-**Status: partial, and precisely so.**
+**Status (2026-09-11): SERVING on vLLM, TP=4, eager. CUDA graphs + DSpark not yet (open, see the Served section).**
 
 | stage | state |
 |---|---|
@@ -11,10 +11,10 @@ onto a small cluster of 128 GB unified-memory machines at TP=4.
 | TP=4 conversion + sharding | ✅ verified (9 min, expert ranges disjoint, `F4` preserved) |
 | engram mmap lookup | ✅ verified (22.9 GiB fp8 table at 0.49 GiB RSS) |
 | `deepseek_v41` config through vLLM's `ModelConfig` | ✅ **end-to-end, 31 assertions** |
-| reference-implementation model **load** | ⚠️ OOMs on the tightest node — see below |
+| reference-implementation model **load** | ✅ with `load_split.py` (per-tensor streaming, engram on `meta`) |
 | reference-implementation **generation** | OK - verified, correct text AND correct multimodal answers |
-| vLLM config + architecture registration | OK - verified in the real server |
-| vLLM **serving** | BLOCKED in `compressor.py` on hardcoded pooling ratios (see below) |
+| vLLM config + architecture registration | superseded — the `deepseek_v4_1` tree ships its own; the shim was only needed on the V4-only build |
+| vLLM **serving** | ✅ **eager, vision + tool calling, 131K ctx** — `launch/`, `build/`, `gate/` (Served section). Graphs + DSpark: crashes on first request (open) |
 
 The config path is genuinely end-to-end: `AutoConfig` parses the real checkpoint and
 `vllm.config.ModelConfig` resolves it at four context lengths. Everything downstream of that
@@ -25,6 +25,57 @@ Everything below was measured on real hardware, not estimated. Numbers that are 
 labelled as such.
 
 ---
+
+## Served — how V4.1 actually runs on vLLM here (2026-09-11)
+
+The working path is the one in [tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark)
+(vLLM branch `dsv41-feat` + seven SM12x/engram-on-disk patches), adapted to a fleet with the full checkpoint local on every rank.
+
+**Image** (`build/`): `vllm/vllm-openai:deepseekv41-flash-0909-arm64` -> `+ FlashInfer 0.7.0rc1` (0.6.18 lacks the SM120
+sparse-MLA decode for V4.1's top-k 1152; `Dockerfile.fi07`) -> `+ prewarmed sparse_mla_sm120 / mxfp8 kernels` (`Dockerfile.v41`,
+`prewarm5.py`) -> `+ the dsv41-feat python tree COPIED over the package` (`Dockerfile.branch`). The 0909 image's compiled
+`_C_stable_libtorch` is kept: it loads on GB10 and covers every custom op the V4.1 NVIDIA path references (verified by scan).
+**Why the tree swap:** the 0909 python tree is a *different revision* from `dsv41-feat` — its `engram.py` carries a DP-engram
+API (`gather_engram_hashes`) that the branch lacks, so the branch's whole-file patches cannot sit on it (`ImportError`).
+6 of the 7 patch files are byte-identical to 0909's originals + the reference diffs; only `engram.py` diverges.
+
+**Patches:** the reference's seven files, bind-mounted per its `patch/mounts.txt`. **Verify their md5s against the
+reference's own table (`patch/README.md`) before every launch** — see the CRLF gotcha below.
+
+**Launch** (`launch/launch41.sh <rank>`, `launch/boot41.sh`): the reference's `dsv41-tp4.sh` shape, plus a fail-closed
+**pre-launch gate** (md5 vs reference table, CR-byte scan, and an in-container import of the model package asserting each
+patch's marker symbol is live), **host-side `docker logs -f` capture** (an engine log must survive a node reboot), and a
+**kill-switch** (`docker kill` at MemAvailable < 2 GiB — a contained failure instead of the hang-guard panic). `gate/check_patches.sh`
+is the standalone no-GPU version of the gate. Set `HEAD_IP`, `RANK{0..3}_IP`, `RANK{0..3}_SSH`, `NCCL_IB_HCA`, `FABRIC_IFACES`,
+`FABRIC_IFACE0`, `DSV41_HOME`, `SERVED_NAMES` for your fleet.
+
+**Serving config that passed (Step A):** `GMU=0.80 MAXLEN=131072 SEQS=8 EAGER=1 SPEC=none TEXT_ONLY=0 PARSERS=1` with
+`--limit-mm-per-prompt {"image":4} --mm-processor-cache-gb 1`. Measured: 48 shards load in ~45 s from local NVMe;
+KV pool 903,846 tokens; ~8 GiB free at steady state; ~15 tok/s single-stream eager; the reference's vision + tool-calling
+suite 7/7. `GMU=0.72` fails cleanly with `No available memory for the cache blocks` (~79 GiB of weights leave no KV).
+
+**Open — CUDA graphs + DSpark (the reference's boot 10, ~74 tok/s):** on this image it loads, sizes KV (839,824 tokens at
+300K), captures graphs and reaches "Application startup complete", then the first request dies with
+`CUDA error: an illegal memory access` in `fused_moe/runner/moe_runner.py:_maybe_reduce_final_output` (MoE output reduction
+under graph replay). Eager runs the same kernels fine. Suspects: the graph-replayed collective on this multi-node build, or the
+0909 extension being sm_120 SASS where the reference rebuilt `_C_stable_libtorch` for sm_121a (`build_stable_ext.sh`). Bisect:
+`EAGER=0 SPEC=none` first.
+
+### Gotchas that cost node reboots
+
+* **CRLF.** A Windows git checkout with `core.autocrlf=true` turns the reference's `mounts.txt` and patch files CRLF. A bind-mount
+  target with a trailing CR is silently created as a *new file Python never imports*, so every patch is inactive while
+  looking mounted. With the engram-on-disk patch inactive each rank loads ~47 GiB of Engram tables on top of ~79 GiB of
+  backbone -> deterministic `NVRM: NV_ERR_NO_MEMORY` on every rank at the same second -> the hang-guard sysctls panic the node.
+  Three fleet-wide reboots before a 60-second no-GPU import test found it. Checking that files matched *each other* across
+  nodes proved nothing; check them against the **reference's** md5 table, and scan for CR bytes.
+* **Memory margins were a red herring.** `gpu_memory_utilization`, `vm.min_free_kbytes`, and a page-cache-drop loop changed
+  nothing — the overload was 47 GiB of tables that should not have been in memory. Docker `--memory` does **not** contain
+  NVRM allocations either.
+* **The post-load dip is normal.** After the last shard, MemAvailable falls from ~22 to ~7 GiB during
+  `process_weights_after_loading` and recovers before KV allocation. A kill-switch above ~10 GiB fires spuriously there.
+* **Preserve the engine log on the host** before any `docker rm -f`; a later preflight's `rm -f` destroyed the only log of a
+  failed boot.
 
 ## TL;DR findings
 
@@ -238,7 +289,7 @@ load_split(model, ckpt_path, rank, world_size)
   process only: no reboot, no kernel OOM-kill event on that node, co-user services still
   `active`. The cap converts a cluster-wide incident into a process-level failure.
 
-### Loading is tighter than converting — expect to tune this
+### Loading is tighter than converting — expect to tune this (hypothesis, not both-arms tested)
 
 With engram on disk the resident backbone is 74.5 GiB of a ~121 GiB unified pool. Weight
 loading then has to read 74.5 GiB of safetensors **through page cache that shares that same
@@ -309,7 +360,7 @@ shape, resolution at several context lengths, and structural field integrity.
 
 ---
 
-## What is still missing to actually serve it
+## What the V4-only build was missing (historical — superseded by the Served section)
 
 Register the architecture and vLLM gets past the config and stops at its model registry. The
 V4 package is substantial and already implements most of what V4.1 needs:
@@ -376,14 +427,15 @@ self.overlap = compress_ratio == 4
 Supporting ratios 1 and 2 means deriving the page-size arithmetic that currently yields 4 and
 8, plus the right `coff` / `sliding_window` / `overlap`, plus whatever
 `compress_norm_rope_store_triton` assumes. Guessing does not raise - it mismatches pages.
-**This is the real blocker, and it lives in vLLM's KV-cache internals, not in config
-plumbing.**
+**Retracted 2026-09-11:** this was true of the **V4-only** vLLM build inspected (`deepseek_v4` package). The official
+`vllm/vllm-openai:deepseekv41-flash-*` images and vLLM branch `dsv41-feat` ship a separate `deepseek_v4_1` package whose
+compressor handles ratios 1 and 2. None of the analysis below is needed to serve V4.1; it is kept as a record of the V4 build.
 
 ---
 
 So: five deltas. Engram needs new machinery but has a clean seam. CED, the candidate pool and
-the DSpark MoE are wiring. The compressor needs work inside vLLM's attention/KV-cache layer,
-and until that is done `vllm serve` cannot load V4.1 at all.
+the DSpark MoE are wiring. On a **V4-only** build the compressor would need that work. On a `deepseek_v4_1` build (`dsv41-feat`), `vllm serve` loads and
+serves V4.1 — see the Served section. The five-delta list below describes the V4 build only.
 
 1. **Engram** — 6 tensor shapes across 2 layers (`embed.weight/.scale`, `wkv.weight/.scale`,
    `q_weight`, `k_weight`).

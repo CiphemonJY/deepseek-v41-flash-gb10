@@ -1,0 +1,20 @@
+# Stage A: FlashInfer 0.7.0rc1 on top of the official V4.1 arm64 image.
+# Adapted from tonyd2wild's build_overlay3.sh; same pinned SHAs. FROM the 0909 tag instead of
+# their overlay1, which skips rebuilding _C_stable_libtorch (the official arm64 build ships it).
+FROM vllm/vllm-openai:deepseekv41-flash-0909-arm64
+ARG FI_SHA=07869c61ba581e6d6b8ad8d142f4a6c89b707cc1
+ARG CUTLASS_SHA=b46b16d003484063bca4ed365e44095c4c6ed633
+ARG CCCL_SHA=16bd510c9b712e82b0ab6cbb630d8e29ba1f7116
+ARG SPDLOG_SHA=c3aed4b68373955e1cc94307683d44dca1515d2b
+RUN pip uninstall -y -q flashinfer-jit-cache flashinfer-cubin flashinfer-python || true
+RUN mkdir -p /opt/fi-src && curl -sL -m 900 "https://codeload.github.com/flashinfer-ai/flashinfer/tar.gz/${FI_SHA}" | tar xz -C /opt/fi-src --strip-components=1 \
+ && mkdir -p /opt/fi-src/3rdparty/cutlass /opt/fi-src/3rdparty/cccl /opt/fi-src/3rdparty/spdlog \
+ && curl -sL -m 900 "https://codeload.github.com/NVIDIA/cutlass/tar.gz/${CUTLASS_SHA}" | tar xz -C /opt/fi-src/3rdparty/cutlass --strip-components=1 \
+ && curl -sL -m 900 "https://codeload.github.com/NVIDIA/cccl/tar.gz/${CCCL_SHA}"       | tar xz -C /opt/fi-src/3rdparty/cccl    --strip-components=1 \
+ && curl -sL -m 900 "https://codeload.github.com/gabime/spdlog/tar.gz/${SPDLOG_SHA}"   | tar xz -C /opt/fi-src/3rdparty/spdlog  --strip-components=1 \
+ && ls /opt/fi-src/3rdparty/cutlass/include/cutlass/cutlass.h /opt/fi-src/3rdparty/cccl/README.md /opt/fi-src/3rdparty/spdlog/include/spdlog/spdlog.h >/dev/null \
+ && cd /opt/fi-src && BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 pip install --no-deps --no-build-isolation -q . \
+ && pip list 2>/dev/null | grep -iE "^flashinfer" && rm -rf /opt/fi-src/build
+ENV VLLM_HAS_FLASHINFER_CUBIN=1
+# the gate that 0.6.18 fails: SM120 sparse-MLA decode must support V4.1's topk of 1152
+RUN python3 -c "import flashinfer; from flashinfer.mla import supported_sparse_mla_sm120_configs as f; c=f()['dsv4']; assert c.supports_decode(num_heads=16, topk=1152); print('fi07 gate OK', flashinfer.__version__)"
