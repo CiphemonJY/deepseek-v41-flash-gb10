@@ -1,232 +1,133 @@
-"""Register `deepseek_v41` with transformers so AutoConfig can parse the checkpoint.
+"""Register `deepseek_v41` so transformers and vLLM can both load the checkpoint.
+
+    import dsv41_config            # registration happens on import
 
 WHY THIS IS NEEDED
-    No released transformers knows this architecture -- verified against 5.16.1 (in the
-    your vLLM image image) and 5.17.0 (newest on PyPI): both ship deepseek_v2/v3/v32/v4 and
-    no v41. So `AutoConfig.from_pretrained` fails before vLLM ever reaches its own model
-    registry:
-        ValueError: checkpoint ... has model type `deepseek_v41` but Transformers does
-                    not recognize this architecture
+    No released transformers knows this architecture -- verified against 5.16.1 and 5.17.0,
+    both of which ship deepseek_v2/v3/v32/v4 and no v41. Without a registered config,
+    AutoConfig fails before vLLM reaches its own model registry.
 
-WHY IT IS SMALL
-    transformers' DeepseekV4Config ALREADY declares the machinery people assume is new:
-    hc_mult / hc_eps / hc_sinkhorn_iters (mHC), index_n_heads / index_head_dim / index_topk
-    (sparse indexer), o_groups / o_lora_rank, compress_rope_theta, swiglu_limit,
-    scoring_func, num_nextn_predict_layers. V4.1 is an increment on the same lineage.
-    And PreTrainedConfig keeps undeclared kwargs as attributes, so the genuinely new
-    fields (engram_*, dspark_*, kv_source_layer_ids, index_source_layer_ids,
-    candidate_*) survive without being declared -- they just need a class to land on.
+WHY IT SUBCLASSES vLLM's CONFIG AND FLATTENS
+    vLLM does NOT use the transformers config class for this family. It has its own
+    `vllm.transformers_utils.configs.deepseek_v4.DeepseekV4Config`, and its multimodal
+    preprocessor enforces it by identity:
 
-    Two real differences are handled explicitly:
-      * V4.1 NESTS text_config / vision_config (each with its own declared model_type);
-        V4-Flash was flat with vision_* prefixed keys.
-      * V4.1 spells the per-layer compression `compress_ratios`; transformers' V4 config
-        calls it `compress_rates`. Aliased below so either name resolves.
+        return self.ctx.get_hf_config(DeepseekV4Config)
+        -> TypeError: Expected type ...DeepseekV4Config, but found ...DeepseekV41Config
 
-WHAT THIS DOES NOT DO
-    It does not make the model runnable. vLLM still needs a DeepseekV41ForCausalLM, and
-    four features are genuinely absent from vllm.models.deepseek_v4 (verified by grep
-    over all 20,881 lines): engram tables, CED cross-layer KV reuse (kv_source_layer_ids /
-    index_source_layer_ids), the hierarchical candidate pool (candidate_*), and the DSpark
-    routed MoE (dspark_n_routed_experts). This file only unblocks config parsing.
+    That class is deliberately thin: it declares the nine FLAT `vision_*` fields plus the
+    rope parameters, and lets every text field arrive as a kwarg that PreTrainedConfig stores
+    as an attribute. It also accepts `rope_scaling` AND `rope_parameters`, which is how V4
+    ends up with the single flat yarn dict vLLM's max-len logic requires -- vLLM's own config
+    performs that normalisation.
 
-USAGE
-    import dsv41_config            # registration happens on import
-    from transformers import AutoConfig
-    cfg = AutoConfig.from_pretrained("/path/to/DeepSeek-V4.1-Flash")
+    So the correct shim is small: subclass vLLM's class, and FLATTEN V4.1's nested
+    `text_config` / `vision_config` into the shape V4 already uses (text fields at top level,
+    vision fields `vision_`-prefixed). That satisfies the isinstance check and every other V4
+    code path at once, instead of one at a time.
+
+    V4.1's genuinely new fields -- engram_*, kv_source_layer_ids, index_source_layer_ids,
+    candidate_*, dspark_* -- need no declaration: PreTrainedConfig keeps unknown kwargs as
+    attributes. They simply need a class to land on.
+
+NOT A RENAME: `compress_ratios` vs `compress_rates`
+    transformers types V4's `compress_rates` as `dict | None`; V4.1's `compress_ratios` is a
+    per-LAYER list of length n_layers + 3 (43 for 40 layers, covering the MTP layers).
+    Passing one as the other trips strict dataclass validation. They stay separate.
 """
+from __future__ import annotations
+
 from transformers import AutoConfig
-from transformers.configuration_utils import PreTrainedConfig
-from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+__all__ = ["DeepseekV41Config", "register", "BASE_IS_VLLM"]
+
+# Prefer vLLM's config class so the isinstance checks inside its V4 implementation pass.
+# Fall back to transformers' when vLLM is not importable, so the config can be inspected
+# and unit-tested without a vLLM install.
+try:
+    from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config as _Base
+    BASE_IS_VLLM = True
+except Exception:  # pragma: no cover - exercised only without vLLM
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
+        DeepseekV4Config as _Base,
+    )
+    BASE_IS_VLLM = False
 
 
-class DeepseekV41VisionConfig(PreTrainedConfig):
-    """DeepSeek-ViT: trained from scratch, 2D-RoPE, 3x3 pixel-unshuffle downsample."""
-
-    model_type = "deepseek_v41_vision"
-
-    def __init__(
-        self,
-        num_hidden_layers: int = 32,
-        hidden_size: int = 1024,
-        num_attention_heads: int = 16,
-        intermediate_size: int = 2816,
-        patch_size: int = 14,
-        rope_theta: float = 10000.0,
-        downsample_ratio: int = 3,
-        max_image_tokens: int = 1024,
-        min_pixels: int = 295936,
-        max_wh_ratio=None,
-        **kwargs,
-    ):
-        self.num_hidden_layers = num_hidden_layers
-        self.hidden_size = hidden_size
-        self.num_attention_heads = num_attention_heads
-        self.intermediate_size = intermediate_size
-        self.patch_size = patch_size
-        self.rope_theta = rope_theta
-        self.downsample_ratio = downsample_ratio
-        self.max_image_tokens = max_image_tokens
-        self.min_pixels = min_pixels
-        self.max_wh_ratio = max_wh_ratio
-        super().__init__(**kwargs)
+# V4.1 nests its vision encoder; V4 spells the same fields flat with a `vision_` prefix.
+_VISION_MAP = {
+    "num_hidden_layers": "vision_n_layers",
+    "hidden_size": "vision_dim",
+    "num_attention_heads": "vision_n_heads",
+    "intermediate_size": "vision_inter_dim",
+    "patch_size": "vision_patch_size",
+    "rope_theta": "vision_rope_theta",
+    "downsample_ratio": "vision_downsample_ratio",
+    "max_image_tokens": "vision_max_n_token",
+    "min_pixels": "vision_min_pixels",
+    "max_wh_ratio": "vision_max_wh_ratio",
+}
 
 
-class DeepseekV41TextConfig(DeepseekV4Config):
-    """V4.1 language backbone. Inherits every V4 field; adds the four new feature groups.
-
-    Declared explicitly (rather than left to kwargs) so that a typo in a checkpoint shows
-    up as a wrong value rather than a silently absent attribute -- the engram hash
-    multipliers are all derived from engram_vocab_size, and the reference implementation
-    asserts engram_compressed_vocab_size against the tokenizer. A mismatch there would
-    silently rehash the whole 189 GiB table.
-    """
-
-    model_type = "deepseek_v41_text"
-
-    def __init__(
-        self,
-        # --- CED: decoder layers reuse KV/index state computed at specific earlier layers
-        kv_source_layer_ids=(2, 8, 14, 20),
-        index_source_layer_ids=(2, 8, 14, 20, 24, 28, 32, 36),
-        # --- hierarchical sparse indexer: deeper layers restricted to a candidate pool
-        candidate_source_layer_id: int = 20,
-        candidate_topk_blocks: int = 2048,
-        candidate_block_size: int = 8,
-        # --- engram conditional memory (196B params, sparse n-gram lookup)
-        engram_layer_ids=(1, 14),
-        engram_num_embeddings=(384006168, 384016682),
-        engram_max_ngram_size: int = 4,
-        engram_vocab_size: int = 16000000,
-        engram_n_heads: int = 8,
-        engram_head_dim: int = 256,
-        engram_pad_token_id: int = 2,
-        engram_compressed_vocab_size: int = 99092,
-        # --- DSpark speculative decoding, now with its own routed MoE
-        dspark_block_size: int = 5,
-        dspark_noise_token_id: int = 128799,
-        dspark_target_layer_ids=(37, 38, 39),
-        dspark_markov_rank: int = 256,
-        dspark_n_routed_experts: int = 128,
-        dspark_num_experts_per_tok: int = 3,
-        # --- spelled `compress_ratios` here, `compress_rates` in transformers' V4 config
-        compress_ratios=None,
-        **kwargs,
-    ):
-        self.kv_source_layer_ids = list(kv_source_layer_ids)
-        self.index_source_layer_ids = list(index_source_layer_ids)
-        self.candidate_source_layer_id = candidate_source_layer_id
-        self.candidate_topk_blocks = candidate_topk_blocks
-        self.candidate_block_size = candidate_block_size
-
-        self.engram_layer_ids = list(engram_layer_ids)
-        self.engram_num_embeddings = list(engram_num_embeddings)
-        self.engram_max_ngram_size = engram_max_ngram_size
-        self.engram_vocab_size = engram_vocab_size
-        self.engram_n_heads = engram_n_heads
-        self.engram_head_dim = engram_head_dim
-        self.engram_pad_token_id = engram_pad_token_id
-        self.engram_compressed_vocab_size = engram_compressed_vocab_size
-
-        self.dspark_block_size = dspark_block_size
-        self.dspark_noise_token_id = dspark_noise_token_id
-        self.dspark_target_layer_ids = list(dspark_target_layer_ids)
-        self.dspark_markov_rank = dspark_markov_rank
-        self.dspark_n_routed_experts = dspark_n_routed_experts
-        self.dspark_num_experts_per_tok = dspark_num_experts_per_tok
-
-        # NOT a rename of V4's `compress_rates`. transformers types that one as
-        # `dict | None`; V4.1's `compress_ratios` is a per-LAYER list (len == n_layers + 3,
-        # covering the MTP layers). Feeding one into the other trips strict dataclass
-        # validation, so they are kept strictly separate.
-        self.compress_ratios = list(compress_ratios) if compress_ratios is not None else None
-
-        super().__init__(**kwargs)
-        self._flatten_rope_parameters()
-
-    def _flatten_rope_parameters(self) -> None:
-        """Collapse the {main, compress} rope split into the flat shape vLLM expects.
-
-        DeepseekV4Config synthesises rope_parameters as two named sub-configs -- `main`
-        (the attention rope) and `compress` (the compressed-KV rope, theta 160000). vLLM
-        only treats a nested rope dict as nested when every key is a LAYER TYPE:
-
-            is_rope_parameters_nested(rp) = set(rp) <= ALLOWED_LAYER_TYPES
-            ALLOWED_LAYER_TYPES = ('full_attention', 'sliding_attention', ...,
-                                   'compressed_sparse_attention', ...)
-
-        {main, compress} is not a subset, so vLLM wraps it as {"": {main:..., compress:...}}
-        and then dies on rp["rope_type"]. vLLM's own loader already flattens this for
-        deepseek_v4 -- verified by running get_config() against a live V4-Flash checkpoint,
-        which yields a single flat yarn dict -- but that normalisation does not fire for
-        model_type deepseek_v41, so we reproduce its output exactly:
-
-            {beta_fast, beta_slow, factor, original_max_position_embeddings,
-             type: yarn, rope_type: yarn, rope_theta: <main's theta>}
-
-        Note the flattened form keeps MAIN's rope_theta (10000), not compress's (160000) --
-        matching what V4 produces. The compress theta stays available as
-        `compress_rope_theta`, which is where the model code reads it from anyway.
-        """
-        rp = getattr(self, "rope_parameters", None)
-        if not isinstance(rp, dict) or "rope_type" in rp:
-            return  # already flat, or absent
-        main, compress = rp.get("main"), rp.get("compress")
-        if not isinstance(compress, dict):
-            return  # unexpected shape; leave it alone rather than guess
-        flat = {k: v for k, v in compress.items() if k not in ("rope_theta",)}
-        flat.setdefault("rope_type", flat.get("type", "yarn"))
-        flat.setdefault("type", flat["rope_type"])
-        if isinstance(main, dict) and "rope_theta" in main:
-            flat["rope_theta"] = main["rope_theta"]
-        elif getattr(self, "rope_theta", None) is not None:
-            flat["rope_theta"] = self.rope_theta
-        self.rope_parameters = flat
+def _flatten(text_config, vision_config, kwargs: dict) -> dict:
+    """Hoist nested sub-configs into the flat shape V4 uses."""
+    flat: dict = {}
+    if text_config:
+        src = text_config if isinstance(text_config, dict) else text_config.to_dict()
+        flat.update({k: v for k, v in src.items() if k != "model_type"})
+    if vision_config:
+        src = vision_config if isinstance(vision_config, dict) else vision_config.to_dict()
+        for k, v in src.items():
+            if k == "model_type":
+                continue
+            flat[_VISION_MAP.get(k, f"vision_{k}" if not k.startswith("vision_") else k)] = v
+    # explicit top-level keys win over anything hoisted
+    flat.update(kwargs)
+    return flat
 
 
-class DeepseekV41Config(PreTrainedConfig):
-    """Composite multimodal config: text backbone + vision encoder."""
+class DeepseekV41Config(_Base):
+    """DeepSeek-V4.1-Flash, presented to vLLM in V4's flat layout."""
 
     model_type = "deepseek_v41"
-    sub_configs = {"text_config": DeepseekV41TextConfig, "vision_config": DeepseekV41VisionConfig}
 
-    def __init__(self, text_config=None, vision_config=None, image_token_id: int = 129264, **kwargs):
-        if text_config is None:
-            text_config = {}
-        if vision_config is None:
-            vision_config = {}
-        self.text_config = (
-            text_config if isinstance(text_config, DeepseekV41TextConfig)
-            else DeepseekV41TextConfig(**text_config)
-        )
-        self.vision_config = (
-            vision_config if isinstance(vision_config, DeepseekV41VisionConfig)
-            else DeepseekV41VisionConfig(**vision_config)
-        )
-        self.image_token_id = image_token_id
-        super().__init__(**kwargs)
+    def __init__(self, text_config=None, vision_config=None, **kwargs):
+        flat = _flatten(text_config, vision_config, kwargs)
 
-    # vLLM and a lot of tooling reach for these on the top-level config
-    @property
-    def hidden_size(self):
-        return self.text_config.hidden_size
+        # vLLM's V4 decoder gates hashed expert routing on a PREFIX rule:
+        #     is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
+        # V4-Flash declares num_hash_layers: 3. V4.1 declares nothing, and the checkpoint
+        # settles why -- it contains ZERO tid2eid/tie2eid tensors, while all 40 layers carry a
+        # normal ffn.gate.*. So V4.1 does not use hashed routing at all: that mechanism was
+        # REPLACED by engram (at layers [1, 14]), not extended by it. num_hash_layers must
+        # therefore be 0, which disables the hash_moe path entirely.
+        #
+        # Do not be tempted to set this to len(engram_layer_ids): engram is not a prefix rule
+        # and is not hashed routing, and conflating them would route two layers through the
+        # wrong MoE implementation.
+        flat.setdefault("num_hash_layers", 0)
+        # keep the nested originals addressable for anything that prefers them, without
+        # letting them reach the strict base __init__
+        nested_text = flat.pop("_nested_text", None)
+        super().__init__(**flat)
+        self._nested_text = nested_text
 
-    @property
-    def num_hidden_layers(self):
-        return self.text_config.num_hidden_layers
-
-    @property
-    def vocab_size(self):
-        return self.text_config.vocab_size
+    def get_text_config(self, decoder=False):
+        """Flat layout: the text config IS this object, as it is for V4."""
+        return self
 
 
-def register() -> None:
-    """Idempotent registration of all three config types."""
-    for cfg in (DeepseekV41Config, DeepseekV41TextConfig, DeepseekV41VisionConfig):
-        try:
-            AutoConfig.register(cfg.model_type, cfg)
-        except ValueError:
-            pass  # already registered
+def register() -> dict:
+    """Idempotent. Returns what was registered so a caller can assert rather than hope."""
+    try:
+        AutoConfig.register(DeepseekV41Config.model_type, DeepseekV41Config)
+    except ValueError:
+        pass  # already registered
+    return {
+        "model_type": DeepseekV41Config.model_type,
+        "base": _Base.__module__ + "." + _Base.__name__,
+        "base_is_vllm": BASE_IS_VLLM,
+    }
 
 
 register()

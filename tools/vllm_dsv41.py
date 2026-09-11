@@ -435,19 +435,90 @@ def _build_model_class(Base):
         docstring for why that works and what it costs.
         """
 
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            cfg = None
-            for a in list(args) + list(kwargs.values()):
-                if hasattr(a, "model_config"):
-                    cfg = a.model_config.hf_config
-                    break
-            self._dsv41_config = cfg
-            self._engram_ready = False
+        # NOTE: deliberately NO __init__ override. vLLM constructs models as
+        # `model_class(vllm_config=..., prefix=...)` with vllm_config KEYWORD-ONLY, and a
+        # `def __init__(self, *args, **kwargs)` wrapper breaks that contract:
+        #     TypeError: DeepseekV4ForConditionalGeneration.__init__() missing 1 required
+        #                keyword-only argument: 'vllm_config'
+        # The config is reachable without intercepting construction, so there is no reason
+        # to sit in that path at all.
+
+        @property
+        def _dsv41_config(self):
+            """The HF config, however this vLLM build exposes it."""
+            for attr in ("config", "hf_config", "text_config"):
+                cfg = getattr(self, attr, None)
+                if cfg is not None and hasattr(cfg, "num_hidden_layers"):
+                    return cfg
+            inner = getattr(self, "model", None)
+            for attr in ("config", "hf_config"):
+                cfg = getattr(inner, attr, None)
+                if cfg is not None and hasattr(cfg, "num_hidden_layers"):
+                    return cfg
+            try:  # set during model construction by vLLM
+                from vllm.config import get_current_vllm_config
+                return get_current_vllm_config().model_config.hf_config
+            except Exception:
+                pass
+            raise RuntimeError("could not locate the HF config on the model")
+
+        def load_weights(self, weights):
+            """Load the backbone via V4's loader, then install engram and wire CED.
+
+            Engram must be installed HERE rather than by a separate call, because vLLM's
+            serving path never calls anything else after construction -- a manual
+            `dsv41_install()` would simply never run, and the model would serve with engram
+            missing. That failure is silent: output stays fluent, it just is not the trained
+            model.
+
+            Two things to note about the weight stream:
+
+            * `layers.N.engram.*` tensors are filtered out before the base loader sees them.
+              V4 has no engram modules, so it would report them as unexpected (or worse,
+              silently drop them).
+            * The engram TABLES are not taken from this stream at all. vLLM shards the
+              original checkpoint itself, so each rank would have to slice its quarter out of
+              a single 91.6 GiB tensor. The pre-sharded `engram{rank}-mp{tp}.safetensors`
+              files from convert_streaming.py already contain exactly that slice, row
+              alignment included, so we mmap those instead. Set DSV41_ENGRAM_DIR to point at
+              them.
+            """
+            engram_seen: list[str] = []
+
+            def _filtered():
+                for name, tensor in weights:
+                    if ".engram." in name:
+                        engram_seen.append(name)
+                        continue
+                    yield name, tensor
+
+            loaded = super().load_weights(_filtered())
+
+            engram_dir = os.environ.get("DSV41_ENGRAM_DIR")
+            if not engram_dir:
+                raise RuntimeError(
+                    "DSV41_ENGRAM_DIR is unset. It must point at the directory holding "
+                    "engram{rank}-mp{tp}.safetensors from convert_streaming.py. Refusing to "
+                    "serve without engram: the model would produce fluent but wrong output "
+                    f"(saw {len(engram_seen)} engram tensors in the checkpoint stream).")
+
+            from transformers import AutoTokenizer
+            from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+            rank = get_tensor_model_parallel_rank()
+            world = get_tensor_model_parallel_world_size()
+            model_path = os.environ.get("DSV41_MODEL_PATH") or engram_dir
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            report = self.dsv41_install(engram_dir, tokenizer, rank, world)
+            report["engram_tensors_filtered"] = len(engram_seen)
+            self.dsv41_report = report
+            if rank == 0:
+                print(f"[vllm_dsv41] {report}", flush=True)
+            return loaded
 
         def dsv41_install(self, ckpt_dir: str, tokenizer, rank: int, world_size: int,
                           mmap_engram: bool = True) -> dict[str, Any]:
-            """Build engram, load its weights, wire CED. Call after the base weights load."""
+            """Build engram, load its weights, wire CED."""
             cfg = self._dsv41_config
             text = _text_config(cfg)
             inner = getattr(self, "model", self)
@@ -468,7 +539,6 @@ def _build_model_class(Base):
                     "computes its own KV and output is incoherent, not merely degraded.")
             report["ced_layers_wired"] = wired
             _install_engram_hook(inner, self.engram_layers, self.engram_hashes)
-            self._engram_ready = True
             return report
 
     return DeepseekV41ForConditionalGeneration

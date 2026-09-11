@@ -12,7 +12,9 @@ onto a small cluster of 128 GB unified-memory machines at TP=4.
 | engram mmap lookup | ✅ verified (22.9 GiB fp8 table at 0.49 GiB RSS) |
 | `deepseek_v41` config through vLLM's `ModelConfig` | ✅ **end-to-end, 31 assertions** |
 | reference-implementation model **load** | ⚠️ OOMs on the tightest node — see below |
-| vLLM **serving** | ❌ four features absent; adaptation drafted, untested |
+| reference-implementation **generation** | OK - verified, correct text AND correct multimodal answers |
+| vLLM config + architecture registration | OK - verified in the real server |
+| vLLM **serving** | BLOCKED in `compressor.py` on hardcoded pooling ratios (see below) |
 
 The config path is genuinely end-to-end: `AutoConfig` parses the real checkpoint and
 `vllm.config.ModelConfig` resolves it at four context lengths. Everything downstream of that
@@ -85,10 +87,22 @@ Config geometry, against V4-Flash for comparison:
 Note V4.1's experts are individually **larger**, not smaller. There are simply more of them
 with the same 6 activated, which is why activated decode params rise 13B → 16B.
 
-Careful with `hash_moe`, which appears in `mlp_layer_types` for *both* models: it is **not**
-engram. It is hashed expert routing — a token-id -> expert-id table stored as
-`layers.N.ffn.gate.tid2eid`, applied to the first `num_hash_layers` layers. vLLM's V4 already
-implements it. Engram is a separate, genuinely new module living at `layers.N.engram.*`.
+### `hash_moe` is not engram, and V4.1 does not use it at all
+
+An earlier version of these notes said engram should attach at V4's existing `hash_moe` /
+`num_hash_layers` plumbing. **That is wrong.** `hash_moe` is hashed expert *routing* - a
+token-id -> expert-id table at `layers.N.ffn.gate.tid2eid`, gated by a prefix rule
+(`layer_index < num_hash_layers`). The checkpoint settles what V4.1 does with it:
+
+```
+tid2eid/tie2eid tensors in V4.1 : 0
+engram layer indices            : [1, 14]
+layers with a normal ffn.gate.* : 40
+```
+
+Zero. V4.1 **replaced** hashed routing with engram rather than extending it. A V4.1 config
+must therefore set `num_hash_layers = 0` to disable that path. Setting it to
+`len(engram_layer_ids)` would route two layers through the wrong MoE implementation.
 
 ---
 
@@ -315,9 +329,61 @@ V4 package is substantial and already implements most of what V4.1 needs:
 | **`candidate_*`** (hierarchical sparse indexer) | **0** | ❌ |
 | **`dspark_n_routed_experts`** (DSpark MoE) | **0** | ❌ |
 
-So four deltas on a mature base — and **only the first touches the weight loader**. Revised
-estimate after digging into vLLM's internals: engram is the only one that needs genuinely new
-machinery; the other three extend or wire up primitives that already exist.
+There is a **fifth** delta, and it is the one that actually blocks serving. Found by running
+it, not by reading it:
+
+### 5. vLLM's compressed-attention is hardcoded to V4's pooling ratios
+
+`compress_ratios` is a per-layer list in both models, but the values differ in kind:
+
+```
+V4-Flash : [0, 0, 4, 128, 4, 128, ..., 4, 0, 0, 0]   distinct {0, 4, 128}  interleaved
+V4.1     : [0, 0, 2x18,  1x20,        0, 0, 0]       distinct {0, 1, 2}    blocked
+```
+
+They are literal pooling ratios in both cases - the reference is explicit: *"Pools
+`compress_ratio` consecutive tokens into one KV latent"*, and it divides `max_seq_len` by the
+value. V4.1 pools 2 tokens where V4 pooled 4 or 128, taking its savings from CED and
+KV-sharing instead. V4.1's blocked structure mirrors its architecture: layers 0-19 encoder,
+20-39 decoder, then 3 MTP.
+
+vLLM cannot express that. Booting V4.1 dies on:
+
+```
+File ".../vllm/models/deepseek_v4/compressor.py", line 152, in __init__
+    assert compress_ratio in [4, 128]
+AssertionError
+```
+
+and it is **not just the assert**. Six places branch on the literal values:
+
+```python
+coff = 1 + (compress_ratio == 4)
+self.sliding_window = coff * compress_ratio
+if   compress_ratio == 4:   self.block_size = 4
+elif compress_ratio == 128: self.block_size = 8
+else: raise ValueError(f"Invalid compress ratio: {compress_ratio}")
+self.overlap = compress_ratio == 4
+... and self.compress_ratio == 128
+```
+
+`block_size` is not a free parameter. From vLLM's own comment:
+
+> Block size is constrained by tensor sharing between compressor states and KV blocks. Since
+> compressor states share the same physical tensor as KV blocks, they must use the same page
+> size. **TODO(yifan): make block size automatically determined and configurable.**
+
+Supporting ratios 1 and 2 means deriving the page-size arithmetic that currently yields 4 and
+8, plus the right `coff` / `sliding_window` / `overlap`, plus whatever
+`compress_norm_rope_store_triton` assumes. Guessing does not raise - it mismatches pages.
+**This is the real blocker, and it lives in vLLM's KV-cache internals, not in config
+plumbing.**
+
+---
+
+So: five deltas. Engram needs new machinery but has a clean seam. CED, the candidate pool and
+the DSpark MoE are wiring. The compressor needs work inside vLLM's attention/KV-cache layer,
+and until that is done `vllm serve` cannot load V4.1 at all.
 
 1. **Engram** — 6 tensor shapes across 2 layers (`embed.weight/.scale`, `wkv.weight/.scale`,
    `q_weight`, `k_weight`).

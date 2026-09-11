@@ -33,6 +33,10 @@ from safetensors.torch import load_model
 
 _HANDLES = []  # safe_open handles; must outlive every lookup
 
+# How much checkpoint to read before releasing the mmap and reopening it. Bounds host RSS
+# growth during load; tune down if a node is tighter, up to trade memory for fewer reopens.
+_RELEASE_EVERY_BYTES = int(os.environ.get("DSV41_LOAD_WINDOW_GIB", "6")) * 2**30
+
 
 def guard_cuda_memory(fraction: float = 0.82) -> None:
     """Cap this process's share of the unified pool so an overrun raises a Python OOM.
@@ -101,6 +105,92 @@ def _mmap_engram_forward(self, indices: torch.Tensor) -> torch.Tensor:
     return values
 
 
+def _stream_load_backbone(model, path: str, verbose: bool):
+    """Copy each tensor from the checkpoint into the model, one at a time.
+
+    Returns (missing, unexpected) with the same meaning as safetensors' load_model(...,
+    strict=False), so the engram verification downstream is unchanged.
+
+    Parameters still on `meta` (the engram tables) are never touched: their keys do not
+    appear in the backbone file, so they fall through to `missing` -- which is exactly what
+    load_split() asserts on.
+    """
+    state = model.state_dict()
+    unexpected: list[str] = []
+    with safe_open(path, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+
+    # Per-tensor copying alone is NOT enough. `del src` drops the Python reference, but the
+    # mmap's file-backed pages stay mapped, so RSS climbs monotonically as we walk the file:
+    # measured 30.5 GiB of host RSS at 40% through a 74.5 GiB checkpoint, which drove the box
+    # into swap (7.1 GiB) with only 10 GiB available. Closing and reopening the handle
+    # munmaps and releases those pages, bounding RSS to roughly one window.
+    done = 0
+    copied_bytes = 0
+    i = 0
+    while i < len(keys):
+        with safe_open(path, framework="pt", device="cpu") as f:
+            window_bytes = 0
+            while i < len(keys) and window_bytes < _RELEASE_EVERY_BYTES:
+                key = keys[i]
+                i += 1
+                target = state.get(key)
+                if target is None:
+                    unexpected.append(key)
+                    continue
+                src = f.get_tensor(key)
+                if tuple(target.shape) != tuple(src.shape):
+                    raise RuntimeError(
+                        f"{key}: checkpoint {tuple(src.shape)} != model {tuple(target.shape)}")
+                nbytes = src.numel() * src.element_size()
+                with torch.no_grad():
+                    target.copy_(src)      # H2D; casts if dtypes differ, as load_model does
+                del src
+                window_bytes += nbytes
+                copied_bytes += nbytes
+                done += 1
+        # handle closed here -> mapping released before the next window opens
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if verbose:
+            print(f"[load_split] {done}/{len(keys)} tensors, "
+                  f"{copied_bytes / 2**30:.1f} GiB copied", flush=True)
+    # Anything the model wants that the backbone file did not provide -- EXCEPT tied
+    # weights. The MTP layers tie their token embedding and output head to the backbone's,
+    # so convert.py deliberately omits `mtp.N.embed.weight` / `mtp.N.head.weight`:
+    #
+    #     if name.startswith("mtp.") and name.split(".", 2)[-1] in ("embed.weight", "head.weight"):
+    #         continue   # an MTP layer ties its ... to the backbone's
+    #
+    # safetensors' load_model() handles this by detecting tensors that share storage and
+    # requiring only one copy in the file. A hand-rolled streaming loader has to do the same
+    # or it reports six phantom missing keys. A tied key needs no copy: writing the backbone's
+    # tensor already wrote it.
+    present = set(keys)
+    loaded_ptrs: dict[int, str] = {}
+    for k in present:
+        t = state.get(k)
+        if t is not None and t.device.type != "meta":
+            loaded_ptrs[t.data_ptr()] = k
+
+    missing, tied = [], {}
+    for k, t in state.items():
+        if k in present:
+            continue
+        if t.device.type != "meta" and t.data_ptr() in loaded_ptrs:
+            tied[k] = loaded_ptrs[t.data_ptr()]   # shares storage with something we wrote
+        else:
+            missing.append(k)
+    if verbose and tied:
+        shown = ", ".join(f"{k} <- {v}" for k, v in list(tied.items())[:3])
+        print(f"[load_split] {len(tied)} tied weight(s) satisfied by shared storage ({shown}"
+              f"{', ...' if len(tied) > 3 else ''})", flush=True)
+    if verbose:
+        print(f"[load_split] streamed {len(keys) - len(unexpected)} tensors, "
+              f"{len(missing)} left for the engram file")
+    return missing, unexpected
+
+
 def load_split(model, ckpt_path: str, rank: int, world_size: int, verbose: bool = True):
     """Drop-in for `load_model(model, f"{ckpt_path}/model{rank}-mp{world_size}.safetensors")`."""
     main_path = os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors")
@@ -109,8 +199,18 @@ def load_split(model, ckpt_path: str, rank: int, world_size: int, verbose: bool 
         if not os.path.exists(p):
             raise FileNotFoundError(p)
 
-    # 1. backbone, resident. strict=False because engram lives in the other file.
-    missing, unexpected = load_model(model, main_path, strict=False)
+    # 1. backbone, resident, STREAMED one tensor at a time.
+    #
+    # safetensors' load_model() takes a bulk path: the mmap'd CPU side and the 74.5 GiB of
+    # device parameters are both live at peak. On a unified-memory box those share ONE pool,
+    # so peak approaches 2x the checkpoint and the tightest node OOMs during load even though
+    # steady state fits comfortably. Measured: a 4-rank load died on the node with 115 GiB
+    # available while its 117 GiB peers survived.
+    #
+    # Copying per tensor and dropping each source immediately keeps host residency flat --
+    # only one tensor is live at a time, and the page cache behind it becomes reclaimable
+    # straight away.
+    missing, unexpected = _stream_load_backbone(model, main_path, verbose and rank == 0)
     if unexpected:
         raise RuntimeError(f"unexpected keys in {main_path}: {unexpected[:5]} ...")
 
