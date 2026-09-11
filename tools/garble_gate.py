@@ -10,7 +10,7 @@ PROMPTS = [
  ("chat", "Count from 1 to 30, comma separated."), ("chat", "List the first 25 prime numbers, comma separated, then say DONE."),
  ("chat", "In one sentence, what is tensor parallelism?"), ("chat", "中国的首都是哪里？只回答城市名。"),
  ("chat", "Write a haiku about a mountain lake."), ("chat", "Explain in three sentences why the sky is blue."),
- ("raw", "The capital of France is"), ("raw", "def fibonacci(n):\n    "),
+ ("raw", "The capital of France is"), ("raw", "Once upon a time, in a small village by the sea,"),
 ]
 def run(kind, prompt, n=48):
     if kind == "chat":

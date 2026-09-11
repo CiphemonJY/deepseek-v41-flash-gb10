@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """battery.py (run on the head node): the council's 4-step battery against :8888. (a) greedy gate; (b) ~2000-token prompt; (c) 6 streams; (d) gate again."""
-import json, subprocess, sys, time, urllib.request, concurrent.futures as cf
+import json, os, subprocess, sys, time, urllib.request, concurrent.futures as cf
 B = "http://127.0.0.1:8888/v1"; M = "deepseek-v4-flash-dspark"
 def chat(content, n):
     body = json.dumps({"model": M, "messages": [{"role": "user", "content": content}], "max_tokens": n, "temperature": 0}).encode()
     t0 = time.time(); d = json.load(urllib.request.urlopen(urllib.request.Request(B + "/chat/completions", body, {"Content-Type": "application/json"}), timeout=900))
     c = d["choices"][0]["message"].get("content") or ""; return c, d["usage"]["completion_tokens"], time.time() - t0
 def gate(tag):
-    r = subprocess.run([sys.executable, "${DSV41_HOME:-$HOME/dsv41}/garble_gate.py", "compare"], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, os.path.expanduser("~/dsv41/garble_gate.py"), "compare"], capture_output=True, text=True)
     last = [l for l in r.stdout.splitlines() if l.startswith("GARBLE_GATE")]; bad = [l for l in r.stdout.splitlines() if " BAD " in l]
     print(f"[{tag}] {last[-1] if last else 'no verdict'} ({len(bad)} bad prompts)"); return r.returncode == 0
 ok_a = gate("a: greedy gate")

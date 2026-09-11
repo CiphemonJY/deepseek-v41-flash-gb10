@@ -93,12 +93,16 @@ baseline, `tools/battery.py`, `tools/xid_since.sh`, `tools/postboot.sh`; launche
 
 * **The minimal graph config is real:** `EAGER=0`, no DSpark, `--language-model-only`, no parsers, LL128 dropped — clean
   on replication under `VLLM_LOGGING_LEVEL=DEBUG` (2/2), 2000-token prompt and 6 concurrent streams clean, zero Xids.
-* **The full config fails deterministically on the first request** (3/3 identical): the first forward yields NaN
-  (`Out of range float` on the response), then `tvm.error.InternalError: [MXFP8 SM120 gemm Runner] Failed to initialize
-  cutlass MXFP8 gemm on sm120` / `Failed to initialize the TMA descriptor 700` (a sticky illegal-address error surfacing at
-  a detection point), and `Xid 31 … FAULT_PDE ACCESS_TYPE_VIRT_READ` on **all four ranks in the same second** — an
-  allocator-computed virtual address whose mapping is gone. Adding **either** DSpark **or** the vision wrapper to the
-  minimal config is sufficient to trigger it.
+* **The full config fails on the first request in 4/4 boots.** In three of them (19:03Z, 19:34Z, 19:54Z) the head log
+  carries `tvm.error.InternalError: [MXFP8 SM120 gemm Runner] Failed to initialize cutlass MXFP8 gemm on sm120` and
+  `Failed to initialize the TMA descriptor 700` (a sticky illegal-address error surfacing at a detection point), preceded
+  by a NaN first forward (`Out of range float` on the response); the 19:13Z boot faulted with illegal-access errors
+  without those two lines. Every event put `Xid 31 ... ACCESS_TYPE_VIRT_READ` on **all four ranks within the same
+  second**; in one event all four faulted at the same virtual address, in another the addresses differed and one rank
+  reported `FAULT_PTE` rather than `FAULT_PDE`. The same-second/all-ranks pattern points at deterministic software; the
+  VA evidence is weaker than a single identical address would be. **What triggers it:** the minimal config is clean;
+  every boot that added *two or more* of {DSpark, vision wrapper, parsers} faulted, including {vision, parsers} without
+  DSpark. No boot added exactly one factor, so "DSpark alone" or "vision alone" is **not established**.
 * **Falsified, each by a single-variable boot:** gmu headroom (0.72 leaves no KV pool; the full config needs ≥0.78),
   `PYTORCH_CUDA_ALLOC_CONF=backend:native` (same fault, louder), `--max-num-batched-tokens 4096` + no mm cache,
   `--no-enable-prefix-caching`, a strong-reference patch to `compilation/breakable_cudagraph.py` (`tools/mk_strongref.py`,
@@ -107,9 +111,19 @@ baseline, `tools/battery.py`, `tools/xid_since.sh`, `tools/postboot.sh`; launche
   `feat/dsv41-swa-bounded-replay` (the latter is a prefix-cache replay fix for the SWA window, not a CUDA-graph fix). The
   reference's exact snapshot is unrecorded, so "same tree as the reference" cannot be verified.
 
-Production stays on **eager + DSpark k=5 + vision + tools** (33-39 tok/s single-stream measured across restores). The
+Production stays on **eager + DSpark k=5 + vision + tools** (30-39 tok/s single-stream across restores: 8-second,
+n=1-2 samples with co-tenant load uncontrolled and no throttling signature in `nvidia-smi`, so read it as ~30-35 with noise). The
 graphs+DSpark config is an open upstream defect on this tree/hardware combination; the evidence above is what an issue
 needs.
+
+### Required environment for the published scripts
+
+`launch/launch41.sh` and `launch/boot41.sh` refuse to run until these are set (`${VAR:?}`): `HEAD_IP` (rank-0 fabric IP),
+`RANK0_IP`..`RANK3_IP`, `RANK0_SSH`..`RANK3_SSH` (ssh targets used by `boot41.sh`), `NCCL_IB_HCA` (e.g. `mlx5_1:1`),
+`FABRIC_IFACES` (comma list), `FABRIC_IFACE0`, `FABRIC_SUBNET` (CIDR). Optional: `DSV41_HOME` (default `$HOME/dsv41`),
+`SERVED_NAMES` (default `deepseek-v41-flash`). Images are rebuilt per node from identical inputs, so image IDs differ
+across ranks; the launcher does not compare them - compare the build-input tarball md5 if you need identity. A
+`GATE_ONLY=1` dry run of the launcher is safe on a serving rank: the gate runs before any container is removed.
 
 ### Gotchas that cost node reboots
 

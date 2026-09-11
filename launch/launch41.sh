@@ -57,10 +57,6 @@ fi
 if [ "$EAGER" != "1" ] && ! grep -q '^model_state.py ' "$PATCH_DIR/mounts.txt"; then
   echo "EAGER=0 needs the Engram prestage patch (model_state.py)" >&2; exit 3; fi
 mkdir -p "$CACHE_HOST"
-docker rm -f "$NAME" 2>/dev/null || true
-sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
-AVAIL_GB=$(( $(grep MemAvailable /proc/meminfo | awk '{print $2}') / 1048576 ))
-[ "$AVAIL_GB" -ge 100 ] || { echo "MemAvailable ${AVAIL_GB} GiB < 100 GiB, refusing to boot" >&2; exit 4; }
 
 # ---- graphs / speculation / mode args ----
 GRAPH_ENV=""
@@ -98,7 +94,12 @@ ok = hasattr(e,"DiskEngramTable") and getattr(e,"_DSV41_ENGRAM_DISK",False) and 
 print("GATE_OK" if ok else "GATE_MARKERS_MISSING")' 2>&1 | grep -vE "^(INFO|WARNING|W0|\[)" | tail -1)
 [ "$GATE_OUT" = "GATE_OK" ] || { echo "GATE FAIL: patch markers not live in $IMAGE -> $GATE_OUT" >&2; exit 5; }
 echo "  pre-launch gate: md5 8/8 vs reference, no CR, all patch markers live in $IMAGE"
-[ "${GATE_ONLY:-0}" = "1" ] && { echo "  GATE_ONLY=1: stopping before docker run (rank $NODE_RANK, image $IMAGE, avail=${AVAIL_GB}GiB)"; exit 0; }
+[ "${GATE_ONLY:-0}" = "1" ] && { echo "  GATE_ONLY=1: stopping before docker run (rank $NODE_RANK, image $IMAGE, avail=$(( $(grep MemAvailable /proc/meminfo | awk '{print $2}') / 1048576 ))GiB)"; exit 0; }
+# only now (gate passed, not a dry run) is it safe to remove a previous container on this rank
+docker rm -f "$NAME" 2>/dev/null || true
+sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
+AVAIL_GB=$(( $(grep MemAvailable /proc/meminfo | awk '{print $2}') / 1048576 ))
+[ "$AVAIL_GB" -ge 100 ] || { echo "MemAvailable ${AVAIL_GB} GiB < 100 GiB, refusing to boot" >&2; exit 4; }
 
 # ---- NCCL profile: legacy = the previous serve's dual-rail/LL128 env (proven in eager); ref = tonyd2wild plain env on our NIC names ----
 HCA0="${HCA%%,*}"; IF0="${FABRIC_IFACE0:?}"
