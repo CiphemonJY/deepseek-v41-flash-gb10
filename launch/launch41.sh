@@ -36,7 +36,7 @@ esac
 # --tokenizer-mode deepseek_v41: NEEDED by the 0909-tree images (0909 tag, :fi07, :v41), REJECTED by the
 # dsv41-feat tree (:branch, their overlay) whose CLI choices lack the literal and auto-resolve from model_type.
 TOK_ARGS=""; case "$IMAGE" in *deepseekv41-flash-0909*|vllm-dsv41:fi07|vllm-dsv41:v41) TOK_ARGS="--tokenizer-mode deepseek_v41" ;; esac
-# RoCE rails: set NCCL_IB_HCA / FABRIC_IFACES / FABRIC_IFACE0 for your nodes (see README)
+# RoCE rails: set NCCL_IB_HCA / FABRIC_IFACES / FABRIC_IFACE0 / FABRIC_SUBNET for your nodes (see README)
 HCA="${NCCL_IB_HCA:?set NCCL_IB_HCA to your RoCE HCA list, e.g. mlx5_1:1,mlx5_3:1}"
 
 # ---- preflight ----
@@ -95,6 +95,18 @@ print("GATE_OK" if ok else "GATE_MARKERS_MISSING")' 2>&1 | grep -vE "^(INFO|WARN
 echo "  pre-launch gate: md5 8/8 vs reference, no CR, all patch markers live in $IMAGE"
 [ "${GATE_ONLY:-0}" = "1" ] && { echo "  GATE_ONLY=1: stopping before docker run (rank $NODE_RANK, image $IMAGE, avail=${AVAIL_GB}GiB)"; exit 0; }
 
+# ---- NCCL profile: legacy = the previous serve's dual-rail/LL128 env (proven in eager); ref = tonyd2wild plain env on our NIC names ----
+HCA0="${HCA%%,*}"; IF0="${FABRIC_IFACE0:?}"
+if [ "${NCCL_ENV_MODE:-legacy}" = "ref" ]; then
+  NCCL_ARGS="-e NCCL_NET=IB -e NCCL_IB_DISABLE=0 -e NCCL_IB_HCA=$HCA0 -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ADDR_RANGE=${FABRIC_SUBNET:?fabric CIDR, e.g. 10.10.0.0/24} -e NCCL_SOCKET_IFNAME=$IF0 -e GLOO_SOCKET_IFNAME=$IF0 -e TP_SOCKET_IFNAME=$IF0 -e MN_IF_NAME=$IF0 -e NCCL_NVLS_ENABLE=0 -e NCCL_CROSS_NIC=0 -e NCCL_IB_MERGE_NICS=0 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG=WARN -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1"
+  for kv in ${NCCL_SET:-}; do NCCL_ARGS="$NCCL_ARGS -e $kv"; done
+else
+  NCCL_ARGS="-e NCCL_NET=IB -e NCCL_IB_DISABLE=0 -e "NCCL_IB_HCA=$HCA" -e NCCL_SOCKET_IFNAME=${FABRIC_IFACES:?set FABRIC_IFACES=<comma list>} -e GLOO_SOCKET_IFNAME=${FABRIC_IFACE0:?} -e NCCL_MAX_NCHANNELS=4 -e NCCL_MIN_NCHANNELS=4 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG=WARN -e NCCL_IB_TC=106 -e NCCL_NET_PLUGIN=none -e NCCL_IB_MERGE_NICS=0 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_PROTO=LL128 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1"
+  # NCCL_DROP="PROTO CROSS_NIC ..." removes -e NCCL_<NAME>=... from the legacy set; NCCL_SET="K=V ..." appends overrides
+  for n in ${NCCL_DROP:-}; do NCCL_ARGS=$(printf "%s" "$NCCL_ARGS" | sed -E "s/-e NCCL_${n}=[^ ]+ ?//"); done
+  for kv in ${NCCL_SET:-}; do NCCL_ARGS="$NCCL_ARGS -e $kv"; done
+fi
+
 # --memory 112g caps the container BELOW the 121.7 GiB unified pool: an overrun is a contained
 # container OOM, not a kernel OOM-kill of unrelated services / a hard reboot (2026-09-11).
 # shellcheck disable=SC2086
@@ -113,12 +125,7 @@ docker run --gpus all -d --name "$NAME" --restart no \
   -e DSV41_ENGRAM_DISK=1 -e DSV41_ENGRAM_DISK_THREADS=32 -e DSV41_ENGRAM_DISK_CHUNK=16 \
   $GRAPH_ENV \
   -e TORCH_CUDA_ARCH_LIST=12.1a -e FLASHINFER_CUDA_ARCH_LIST=12.1a -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
-  -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 -e "NCCL_IB_HCA=$HCA" \
-  -e NCCL_SOCKET_IFNAME=${FABRIC_IFACES:?set FABRIC_IFACES=<comma list>} -e GLOO_SOCKET_IFNAME=${FABRIC_IFACE0:?} \
-  -e NCCL_MAX_NCHANNELS=4 -e NCCL_MIN_NCHANNELS=4 -e NCCL_CROSS_NIC=1 -e NCCL_CUMEM_ENABLE=0 \
-  -e NCCL_IGNORE_CPU_AFFINITY=1 -e NCCL_DEBUG=WARN -e NCCL_IB_TC=106 -e NCCL_NET_PLUGIN=none \
-  -e NCCL_IB_MERGE_NICS=0 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_PROTO=LL128 \
-  -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+  $NCCL_ARGS \
   "$IMAGE" \
     /models/DeepSeek-V4.1-Flash \
     --served-model-name ${SERVED_NAMES:-deepseek-v41-flash} --host 0.0.0.0 --port "$PORT" \
@@ -147,13 +154,14 @@ setsid nohup bash -c '
     docker ps -q -f name='"$NAME"' | grep -q . || exit 0            # container gone: stop
     curl -sf -m 4 http://127.0.0.1:'"$PORT"'/v1/models >/dev/null 2>&1 && exit 0   # serving: stop
     a=$(( $(grep MemAvailable /proc/meminfo | awk "{print \$2}") / 1048576 ))
-    if [ "$a" -lt 2 ]; then docker kill '"$NAME"' >/dev/null 2>&1; echo "$(date -u +%FT%TZ) MEMGUARD KILLED '"$NAME"' at MemAvailable=${a}GiB" >> ${DSV41_HOME:-$HOME/dsv41}/logs/memguard-rank'"$NODE_RANK"'.log; exit 0; fi
-    [ "$a" -lt 5 ] && { '"$DROP"' >/dev/null 2>&1; }
+    if [ "$a" -lt 2 ]; then low=$((${low:-0}+1)); else low=0; fi
+    if [ "${low:-0}" -ge 2 ]; then docker kill '"$NAME"' >/dev/null 2>&1; echo "$(date -u +%FT%TZ) MEMGUARD KILLED '"$NAME"' at MemAvailable=${a}GiB" >> ${DSV41_HOME:-$HOME/dsv41}/logs/memguard-rank'"$NODE_RANK"'.log; exit 0; fi
+    [ "$a" -lt 6 ] && { '"$DROP"' >/dev/null 2>&1; }
     sleep 2
   done
 ' >/dev/null 2>&1 < /dev/null &
-echo "  mem-guard armed: drop cache <5GiB, docker kill <2GiB -- steady state at gmu 0.78-0.80 is ~4-7GiB free (contained failure beats the hang-guard panic)"
+echo "  mem-guard armed: drop cache <6GiB, docker kill <2GiB for 2 consecutive samples -- steady state at gmu 0.78-0.80 is ~4-7GiB free (contained failure beats the hang-guard panic)"
 
-echo "launched $NAME rank=$NODE_RANK image=$IMAGE patches=$PATCH_DIR gmu=$GMU maxlen=$MAXLEN seqs=$SEQS eager=$EAGER spec=$SPEC text_only=$TEXT_ONLY avail=${AVAIL_GB}GiB"
+echo "launched $NAME rank=$NODE_RANK nccl=${NCCL_ENV_MODE:-legacy}${NCCL_DROP:+-drop:$NCCL_DROP}${NCCL_SET:+-set:$NCCL_SET} image=$IMAGE patches=$PATCH_DIR gmu=$GMU maxlen=$MAXLEN seqs=$SEQS eager=$EAGER spec=$SPEC text_only=$TEXT_ONLY avail=${AVAIL_GB}GiB"
 sleep 3
 docker ps --format '{{.Names}} {{.Status}}' | grep "$NAME" || { echo "$NAME exited" >&2; docker logs --tail 40 "$NAME" >&2; exit 1; }

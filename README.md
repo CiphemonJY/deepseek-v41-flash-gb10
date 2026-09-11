@@ -3,7 +3,7 @@
 Field notes and working code for getting [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 onto a small cluster of 128 GB unified-memory machines at TP=4.
 
-**Status (2026-09-11): SERVING on vLLM, TP=4 — eager + DSpark k=5 (~33 tok/s single-stream). CUDA graphs: unusable on this image (garbled output), see the bisect.**
+**Status (2026-09-11): SERVING on vLLM, TP=4 — eager + DSpark k=5 (33-35 tok/s single-stream), vision + tools. CUDA graphs: no usable configuration on this fleet after 12 boots / 2 lineages / 3 NCCL envs (see the graphs section).**
 
 | stage | state |
 |---|---|
@@ -65,6 +65,25 @@ this tree's `CUDA_SUPPORTED_ARCHS` tops out at 12.0, so `TORCH_CUDA_ARCH_LIST=12
 Remaining suspects, untested: the exact nightly base they used (`nightly-8a728663`) vs the 0909 image's other libraries
 (torch/NCCL/FlashInfer build), and the graph-replayed sparse-MLA/collective path on this fabric. Eager + DSpark is the
 stable configuration here.
+
+### CUDA graphs on this fleet: investigated, no usable configuration (2026-09-11, 12 boots)
+
+Two full image lineages were built and tested: the 0909 tag + branch tree (`Dockerfile.branch`) and the reference's exact
+lineage (`build/nightly_chain.sh`: `nightly-8a728663` + branch tree + `_C_stable_libtorch` rebuilt against its torch via
+`ext_build_inner.sh` in 6 minutes + FlashInfer 0.7.0rc1 + prewarms). Both load, pass the gate, and serve correctly in eager.
+With CUDA graphs on (`EAGER=0`), **11 of 12 boots produced garbage from the first token** (engine up, HTTP 200, `�care…`),
+across three NCCL environments (the previous serve's dual-rail/LL128 env, the same minus `NCCL_PROTO=LL128`, and the reference's
+plain env with a 4-channel cap). The single clean graph boot was the minimal config — no DSpark, `--language-model-only`, no
+parsers, LL128 dropped — at 28.8 tok/s cold, observed once and not reproduced; every combination that adds DSpark, vision, or
+the parsers garbled, so none of those is the discriminator. That minimal config is slower than eager + DSpark (33-35 tok/s)
+and drops features, so **graphs are off in production here**. Forced `NCCL_PROTO=LL128` is the best-supported suspect (all
+three lineages garbled with it; the one clean boot was without it) but not a certified cause. `launch41.sh` exposes
+`NCCL_DROP="PROTO ..."` / `NCCL_SET="K=V ..."` / `NCCL_ENV_MODE=ref` for further bisecting; note the reference's plain env
+without a channel cap costs ~7 GiB of load-time headroom on this fleet and gets killed by the memguard. Untested: host-level
+differences from the reference (driver/firmware/`90-spark-hang-guard` sysctls) and `VLLM_USE_BREAKABLE_CUDAGRAPH`.
+
+**Production config:** `EAGER=1 SPEC=dspark SPEC_K=5 TEXT_ONLY=0 PARSERS=1 GMU=0.80 MAXLEN=131072 NCCL_DROP=PROTO` on the
+0909-lineage image — 33-35 tok/s single-stream, 7/7 vision + tools, 4-way concurrent garble check clean.
 
 ### Gotchas that cost node reboots
 
