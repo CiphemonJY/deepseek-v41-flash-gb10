@@ -74,9 +74,10 @@ Config geometry, against V4-Flash for comparison:
 Note V4.1's experts are individually **larger**, not smaller. There are simply more of them
 with the same 6 activated, which is why activated decode params rise 13B → 16B.
 
-`mlp_layer_types` containing **`hash_moe`** in *both* models is a useful signal: engram is the
-evolution of V4's hash layers, so V4's `num_hash_layers` plumbing is the natural place to
-attach it.
+Careful with `hash_moe`, which appears in `mlp_layer_types` for *both* models: it is **not**
+engram. It is hashed expert routing — a token-id -> expert-id table stored as
+`layers.N.ffn.gate.tid2eid`, applied to the first `num_hash_layers` layers. vLLM's V4 already
+implements it. Engram is a separate, genuinely new module living at `layers.N.engram.*`.
 
 ---
 
@@ -280,14 +281,20 @@ V4 package is substantial and already implements most of what V4.1 needs:
 | **`candidate_*`** (hierarchical sparse indexer) | **0** | ❌ |
 | **`dspark_n_routed_experts`** (DSpark MoE) | **0** | ❌ |
 
-So four deltas on a mature base — and **only the first touches the weight loader**:
+So four deltas on a mature base — and **only the first touches the weight loader**. Revised
+estimate after digging into vLLM's internals: engram is the only one that needs genuinely new
+machinery; the other three extend or wire up primitives that already exist.
 
 1. **Engram** — 6 tensor shapes across 2 layers (`embed.weight/.scale`, `wkv.weight/.scale`,
    `q_weight`, `k_weight`). The reference module is ~75 lines; attach at the existing
    `hash_moe` layer type.
 2. **CED** — decoder layers project global KV from the final encoder hidden states rather than
-   their own, driven by `kv_source_layer_ids` / `index_source_layer_ids`. Needs per-layer KV
-   aliasing. No new weights.
+   their own, driven by `kv_source_layer_ids` / `index_source_layer_ids`. No new weights, and
+   **vLLM already has the primitive**: `kv_sharing_target_layer_name` is a first-class
+   cross-layer KV sharing mechanism (~50 files reference it; `v1/worker/gpu/attn_utils.py`
+   skips cache allocation for layers that share a target, and Gemma-4's speculator uses it).
+   Mapping `kv_source_layer_ids` onto it looks like wiring rather than invention — which also
+   means the KV-cache accounting comes for free.
 3. **Hierarchical sparse indexer** — `candidate_source_layer_id`, `candidate_topk_blocks`,
    `candidate_block_size` restrict deeper indexing layers to a candidate pool built by the
    first Full-mode layer. Extends the existing indexer. No new weights.
