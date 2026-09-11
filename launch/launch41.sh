@@ -49,6 +49,11 @@ while read -r f rel; do
   test -f "$PATCH_DIR/$f" || { echo "PATCH FILE MISSING: $PATCH_DIR/$f" >&2; exit 3; }
   PATCH_MOUNTS="$PATCH_MOUNTS -v $PATCH_DIR/$f:$SITE/$rel:ro"
 done < "$PATCH_DIR/mounts.txt"
+# extra (experimental) mounts: "<file> <site-relative path>" per line in mounts.extra.txt -- not md5-gated, logged
+if [ -f "$PATCH_DIR/mounts.extra.txt" ]; then
+  while read -r f rel; do [ -z "$f" ] && continue; test -f "$PATCH_DIR/$f" || { echo "EXTRA PATCH MISSING: $PATCH_DIR/$f" >&2; exit 3; }
+    PATCH_MOUNTS="$PATCH_MOUNTS -v $PATCH_DIR/$f:$SITE/$rel:ro"; EXTRA_PATCHES="${EXTRA_PATCHES:-}$f($(md5sum "$PATCH_DIR/$f" | cut -c1-8)) "; done < "$PATCH_DIR/mounts.extra.txt"
+fi
 if [ "$EAGER" != "1" ] && ! grep -q '^model_state.py ' "$PATCH_DIR/mounts.txt"; then
   echo "EAGER=0 needs the Engram prestage patch (model_state.py)" >&2; exit 3; fi
 mkdir -p "$CACHE_HOST"
@@ -107,6 +112,7 @@ else
   for kv in ${NCCL_SET:-}; do NCCL_ARGS="$NCCL_ARGS -e $kv"; done
 fi
 
+EXTRA_ENV_ARGS=""; for kv in ${EXTRA_ENV:-}; do EXTRA_ENV_ARGS="$EXTRA_ENV_ARGS -e $kv"; done
 # --memory 112g caps the container BELOW the 121.7 GiB unified pool: an overrun is a contained
 # container OOM, not a kernel OOM-kill of unrelated services / a hard reboot (2026-09-11).
 # shellcheck disable=SC2086
@@ -118,8 +124,8 @@ docker run --gpus all -d --name "$NAME" --restart no \
   -v "$CACHE_HOST:/cache" \
   $PATCH_MOUNTS \
   -e VLLM_HOST_IP=$HOST_IP -e HF_HOME=/cache/huggingface -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
-  -e VLLM_CACHE_ROOT=/cache/vllm -e TILELANG_CACHE_DIR=/cache/tilelang -e TRITON_CACHE_DIR=/cache/triton \
-  -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e VLLM_CACHE_ROOT=/cache/vllm${CACHE_TAG:+-$CACHE_TAG} -e TILELANG_CACHE_DIR=/cache/tilelang${CACHE_TAG:+-$CACHE_TAG} -e TRITON_CACHE_DIR=/cache/triton${CACHE_TAG:+-$CACHE_TAG} \
+  -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e "PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF:-expandable_segments:True}" -e "VLLM_LOGGING_LEVEL=${LOG_LEVEL:-INFO}" $EXTRA_ENV_ARGS \
   -e VLLM_USE_RUST_FRONTEND=0 -e VLLM_HAS_FLASHINFER_CUBIN=1 -e VLLM_USE_FLASHINFER_SAMPLER=0 \
   -e MAX_JOBS=2 -e FLASHINFER_NVCC_THREADS=1 \
   -e DSV41_ENGRAM_DISK=1 -e DSV41_ENGRAM_DISK_THREADS=32 -e DSV41_ENGRAM_DISK_CHUNK=16 \
@@ -162,6 +168,6 @@ setsid nohup bash -c '
 ' >/dev/null 2>&1 < /dev/null &
 echo "  mem-guard armed: drop cache <6GiB, docker kill <2GiB for 2 consecutive samples -- steady state at gmu 0.78-0.80 is ~4-7GiB free (contained failure beats the hang-guard panic)"
 
-echo "launched $NAME rank=$NODE_RANK nccl=${NCCL_ENV_MODE:-legacy}${NCCL_DROP:+-drop:$NCCL_DROP}${NCCL_SET:+-set:$NCCL_SET} image=$IMAGE patches=$PATCH_DIR gmu=$GMU maxlen=$MAXLEN seqs=$SEQS eager=$EAGER spec=$SPEC text_only=$TEXT_ONLY avail=${AVAIL_GB}GiB"
+echo "launched $NAME rank=$NODE_RANK extra=${EXTRA_PATCHES:-none} log=${LOG_LEVEL:-INFO} alloc=${ALLOC_CONF:-expandable_segments:True} cache=${CACHE_TAG:-shared} nccl=${NCCL_ENV_MODE:-legacy}${NCCL_DROP:+-drop:$NCCL_DROP}${NCCL_SET:+-set:$NCCL_SET} image=$IMAGE patches=$PATCH_DIR gmu=$GMU maxlen=$MAXLEN seqs=$SEQS eager=$EAGER spec=$SPEC text_only=$TEXT_ONLY avail=${AVAIL_GB}GiB"
 sleep 3
 docker ps --format '{{.Names}} {{.Status}}' | grep "$NAME" || { echo "$NAME exited" >&2; docker logs --tail 40 "$NAME" >&2; exit 1; }

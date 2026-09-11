@@ -85,6 +85,32 @@ differences from the reference (driver/firmware/`90-spark-hang-guard` sysctls) a
 **Production config:** `EAGER=1 SPEC=dspark SPEC_K=5 TEXT_ONLY=0 PARSERS=1 GMU=0.80 MAXLEN=131072 NCCL_DROP=PROTO` on the
 0909-lineage image — 33-35 tok/s single-stream, 7/7 vision + tools, 4-way concurrent garble check clean.
 
+### Second investigation (council + red-team loop, 2026-09-11 evening): the defect, named
+
+Six more graph boots with per-boot instrumentation (`tools/garble_gate.py` greedy token-level gate against an eager
+baseline, `tools/battery.py`, `tools/xid_since.sh`, `tools/postboot.sh`; launcher knobs `LOG_LEVEL`, `ALLOC_CONF`,
+`EXTRA_ENV`, `CACHE_TAG`, `mounts.extra.txt`) established:
+
+* **The minimal graph config is real:** `EAGER=0`, no DSpark, `--language-model-only`, no parsers, LL128 dropped — clean
+  on replication under `VLLM_LOGGING_LEVEL=DEBUG` (2/2), 2000-token prompt and 6 concurrent streams clean, zero Xids.
+* **The full config fails deterministically on the first request** (3/3 identical): the first forward yields NaN
+  (`Out of range float` on the response), then `tvm.error.InternalError: [MXFP8 SM120 gemm Runner] Failed to initialize
+  cutlass MXFP8 gemm on sm120` / `Failed to initialize the TMA descriptor 700` (a sticky illegal-address error surfacing at
+  a detection point), and `Xid 31 … FAULT_PDE ACCESS_TYPE_VIRT_READ` on **all four ranks in the same second** — an
+  allocator-computed virtual address whose mapping is gone. Adding **either** DSpark **or** the vision wrapper to the
+  minimal config is sufficient to trigger it.
+* **Falsified, each by a single-variable boot:** gmu headroom (0.72 leaves no KV pool; the full config needs ≥0.78),
+  `PYTORCH_CUDA_ALLOC_CONF=backend:native` (same fault, louder), `--max-num-batched-tokens 4096` + no mm cache,
+  `--no-enable-prefix-caching`, a strong-reference patch to `compilation/breakable_cudagraph.py` (`tools/mk_strongref.py`,
+  mountable via `mounts.extra.txt`), the NCCL environment (three variants), and the image lineage (two).
+* **Tree provenance:** upstream deleted `dsv41-feat` on 2026-09-11; successors are `dsv41-optimized` and
+  `feat/dsv41-swa-bounded-replay` (the latter is a prefix-cache replay fix for the SWA window, not a CUDA-graph fix). The
+  reference's exact snapshot is unrecorded, so "same tree as the reference" cannot be verified.
+
+Production stays on **eager + DSpark k=5 + vision + tools** (33-39 tok/s single-stream measured across restores). The
+graphs+DSpark config is an open upstream defect on this tree/hardware combination; the evidence above is what an issue
+needs.
+
 ### Gotchas that cost node reboots
 
 * **CRLF.** A Windows git checkout with `core.autocrlf=true` turns the reference's `mounts.txt` and patch files CRLF. A bind-mount
