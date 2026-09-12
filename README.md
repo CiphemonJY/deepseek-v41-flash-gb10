@@ -3,7 +3,7 @@
 Field notes and working code for getting [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 onto a small cluster of 128 GB unified-memory machines at TP=4.
 
-**Status (2026-09-11): SERVING on vLLM, TP=4 — eager + DSpark k=5 (30-39 tok/s single-stream), vision + tools. CUDA graphs: no usable configuration on this fleet after 12 boots / 2 lineages / 3 NCCL envs (see the graphs section).**
+**Status (2026-09-12): SERVING on vLLM, TP=4 - eager + DSpark k=5, vision + tools, 131K ctx. Verified today: greedy gate PASS, vision/tools 7/7, 60/60 promo, 0 Xid, 32.5 / 68.6 / 98.6 tok/s at 1 / 3 / 6 streams. CUDA graphs: CLOSED as not worth pursuing after ~40 boots - the residual fault is intermittent and invisible to every gate, and graphs are not faster in aggregate here anyway (see "CUDA graphs: closed").**
 
 | stage | state |
 |---|---|
@@ -14,7 +14,7 @@ onto a small cluster of 128 GB unified-memory machines at TP=4.
 | reference-implementation model **load** | ✅ with `load_split.py` (per-tensor streaming, engram on `meta`) |
 | reference-implementation **generation** | OK - verified, correct text AND correct multimodal answers |
 | vLLM config + architecture registration | superseded — the `deepseek_v4_1` tree ships its own; the shim was only needed on the V4-only build |
-| vLLM **serving** | ✅ **eager + DSpark k=5, vision + tool calling, 131K ctx, ~30-35 tok/s** — `launch/`, `build/`, `gate/` (Served section). CUDA graphs: garbled on this image (bisected) |
+| vLLM **serving** | OK **eager + DSpark k=5, vision + tool calling, 131K ctx, 32-36 tok/s single / ~99 aggregate at 6 streams** - `launch/`, `build/`, `gate/`. CUDA graphs: investigated to a stop, see below |
 
 The config path is genuinely end-to-end: `AutoConfig` parses the real checkpoint and
 `vllm.config.ModelConfig` resolves it at four context lengths. Everything downstream of that
@@ -65,6 +65,60 @@ this tree's `CUDA_SUPPORTED_ARCHS` tops out at 12.0, so `TORCH_CUDA_ARCH_LIST=12
 Remaining suspects, untested: the exact nightly base they used (`nightly-8a728663`) vs the 0909 image's other libraries
 (torch/NCCL/FlashInfer build), and the graph-replayed sparse-MLA/collective path on this fabric. Eager + DSpark is the
 stable configuration here.
+
+### CUDA graphs: closed (2026-09-12) - two independent reasons, and one result worth stealing
+
+After roughly forty 4-node boots, graph mode is closed here. Neither reason is about finding the right flag.
+
+**1. The residual fault is intermittent and no gate can see it.** A step-level probe (`tools/mk_engram_probe.py`)
+records, inside the forward and therefore legal under capture, the NaN/inf count and abs-max of every layer's
+hidden state plus the engram rows, the `wkv` output and the engram output, and reports them eagerly between
+steps. With graphs on and engram rows real, one boot produced **997 probe reports of which 17 carried NaN layers
+(~1.7% of steps)** - and in that same boot the greedy gate PASSED, the vision/tools suite went 7/7, a 60-request
+promo gate went 60/60, and all four ranks logged 0 Xid. A config that silently corrupts ~1.7% of steps while
+passing every gate in the promotion path is worse than one that fails loudly.
+
+Mechanism, as far as the probes take it:
+
+* The NaN always appears in an **attention output**, at a layer that varies between boots (observed at layer 0
+  and at layer 22, always propagating to the end of the stack).
+* It is **never** in engram arithmetic. A captured-vs-eager comparison of the fp8 `wkv` GEMM on the identical
+  staged rows gives **maxdiff 0** in every boot, clean or corrupt. The MXFP8 GEMM and the TMA-descriptor errors
+  from the early logs are symptoms, not the cause.
+* Zeroing the engram rows only while graphs are **captured** changes nothing (the capture path runs through the
+  model state's dummy-inputs method, which stages nothing; we forced zeros there and the next real request was
+  still garbage). **The capture-time-content hypothesis is falsified.**
+* Starting the engine with rows zeroed through warmup *and* the first real steps, then switching to real rows,
+  **delays** the fault rather than preventing it: the first real-row requests are clean and correct, then a later
+  step goes NaN and returns an empty completion, then it recovers.
+
+**2. Graphs are not faster on this hardware even when they work.** Same fleet, measurements 30 minutes apart:
+
+| concurrent streams | CUDA graphs | eager |
+|---|---|---|
+| 1 | 35.8 tok/s | 32.5 tok/s |
+| 3 | 56.2 | 68.6 |
+| 6 | 88.2 | 98.6 |
+
+About 10% single-stream, and **worse in aggregate** where a shared serve actually lives. (n=1 per point with
+co-tenant load uncontrolled, so read it as directional - but there is no prize to chase.)
+
+**The result worth stealing, whatever hardware you are on: a greedy output gate cannot detect a feature being
+silently disabled.** With the engram rows forced to zero - engram contributing literally nothing - our
+token-exact greedy gate against an eager baseline still returned PASS. So "gate PASS" said nothing about engram
+quality, which matters because the one graph configuration that *is* clean here achieves it by dropping the
+engram prestage patch, and under full-graph decode the in-forward disk lookup cannot run (it needs a host round
+trip and is guarded against capture). That configuration measured 44.6 tok/s single-stream and passed everything
+we had - while computing with a disabled feature. **If a config wins by removing a component, build a detector
+that sees the component, not just the output.** Ours is the step-level probe above.
+
+**Falsified along the way, so you need not repeat them:** forcing `NCCL_PROTO=LL128` (a real fault on a RoCE
+fabric, dropped in production), rebuilding `_C_stable_libtorch` for `sm_121a` (with CUDA >= 13 the build resolves
+to the `12.0f` family target, so the artifact is byte-equivalent to stock - check with
+`cuobjdump -lelf <lib> | grep -oE 'sm_[0-9]+[a-z]?' | sort -u` before spending a window), `FULL_DECODE_ONLY`
+(eager prefill, still corrupt), capture-safe staging, moving the `wkv` GEMM out of the graph, allocator backends,
+image lineage, prefix caching, graph-pool strong references, headroom, parsers, text-only mode, and widening the
+eager region.
 
 ### CUDA graphs on this fleet: investigated, no usable configuration (2026-09-11, 12 boots)
 
